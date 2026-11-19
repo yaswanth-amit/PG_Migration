@@ -1,0 +1,144 @@
+# Mapping: dbo.autodata (SQL Server) -> production_core.autodata (PostgreSQL)
+# Status: all questions answered - awaiting final approval
+# Wave: after all master_data tables. This is the large transaction table: batched in 15-day windows.
+# Conventions (null handling, no dropped rows, lookups): see ../master_data/_conventions.yaml
+#
+# Two conventions used here that the master_data files did not need:
+#   - match values written as "@column" refer to a TARGET column already resolved earlier in this file
+#     (for example "@machine_iot_id"); plain values refer to SOURCE columns.
+#   - rule: derived with a name = a rule computed from several columns, described under 'derived_rules'.
+
+source:
+  database: TPM_PGSQL
+  schema: dbo
+  table: autodata
+  natural_key: [id]
+
+target:
+  schema: production_core
+  table: autodata
+  primary_key: [id]              # PRIMARY KEY (id) is the only constraint; id has a default sequence
+  unique: []
+
+depends_on: [machine_information, component_information, component_operation_pricing, employee_information, down_code_information]
+
+lookup_source:
+  database: postgres               # lookups join against the already-loaded master_data tables in Postgres
+  load: once_per_run               # read each lookup table into a DataFrame once, reuse it for every batch
+  tables: [machine_information, component_information, component_operation_pricing, employee_information, down_code_information]
+
+extra_source_tables:
+  - table: PredefinedDownCodeInfo      # DownId nvarchar(100) NN, InterfaceID nvarchar(100); read once, to recognise predefined down codes
+    used_for: down_iot_id
+
+batching:
+  strategy: date_window
+  column: sttime                       # source column that decides the window
+  days: 15
+  boundaries: half_open                # sttime >= start AND sttime < end
+  null_window: true                    # one extra window for sttime IS NULL, so no row is lost
+
+columns:
+  # id is not mapped: the target generates it from its sequence (owner's decision)
+
+  # --- who / what, resolved to iot ids. autodata holds INTERFACE ids, so lookups match on interface_id ---
+  # The lookups are done in the DataFrame: the master_data tables are read ONCE from Postgres
+  # (interface_id -> iot_id) and joined to every batch. They are not read from SQL Server.
+  - {dst: machine_iot_id,   src: mc,   rule: lookup, table: machine_information,   match: {interface_id: mc},   return: iot_id}   # nvarchar(100) -> integer
+  - {dst: component_iot_id, src: comp, rule: lookup, table: component_information, match: {interface_id: comp}, return: iot_id}   # nvarchar(100) -> integer
+  - {dst: operation_iot_id, src: opn,  rule: lookup, table: component_operation_pricing, match: {machine_iot_id: "@machine_iot_id", component_iot_id: "@component_iot_id", interface_id: opn}, return: iot_id}   # operation interface ids repeat across components, so machine and component are matched too
+  - {dst: operator_iot_id,  src: opr,  rule: lookup, table: employee_information,  match: {interface_id: opr},  return: iot_id}   # nvarchar(100) -> integer
+  - {dst: down_iot_id,      src: dcode, rule: lookup, table: down_code_information, match: {interface_id: dcode}, predefined_match: {down_id: dcode}, predefined_names_from: PredefinedDownCodeInfo.DownId, case_sensitive: false, return: iot_id}   # predefined codes (NO_DATA, SCI, McTI, ...) match on down_id, all others on interface_id
+  - {dst: component_interface_id, src: comp, rule: copy}            # nvarchar(100) -> text; kept as text beside the iot id
+  - {dst: operation_interface_id, src: opn,  rule: copy}            # nvarchar(100) -> text; kept as text beside the iot id
+
+  # --- cycle ---
+  - {dst: datatype,    src: datatype,   rule: cast, to: smallint}   # tinyint  -> smallint (widening)
+  - {dst: st_date,     src: stdate,     rule: cast, to: date}       # datetime -> date
+  - {dst: nd_date,     src: nddate,     rule: cast, to: date}       # datetime -> date
+  - {dst: st_time,     src: sttime,     rule: copy}                 # datetime -> timestamp without time zone
+  - {dst: nd_time,     src: ndtime,     rule: copy}                 # datetime -> timestamp without time zone
+  - {dst: mst_time,    src: msttime,    rule: copy}                 # datetime -> timestamp without time zone
+  - {dst: cycle_time,  src: cycletime,  rule: copy}                 # int -> integer
+  - {dst: load_unload, src: loadunload, rule: copy}                 # int -> integer
+  - {dst: comp_slno,   src: compslno,   rule: copy}                 # int -> integer
+  - {dst: post,        src: post,       rule: copy}                 # smallint -> smallint
+
+  # --- quantities (numeric(10,5) in the target: range 0..99999.99999) ---
+  - {dst: part_count,  src: PartsCount, rule: cast, to: "numeric(10,5)", range_check: true}   # decimal(18,5) -> numeric(10,5): a narrower type, but no real value exceeds it (confirmed)
+  - {dst: kwh,         src: KWH,        rule: cast, to: "numeric(10,5)", range_check: true}   # float -> numeric(10,5): converted from its exact decimal text, never rounded by binary arithmetic
+  - {dst: net_kwh,     src: NetKWH,     rule: cast, to: "numeric(10,5)", range_check: true}   # float -> numeric(10,5)
+
+  # --- text and flags ---
+  - {dst: workorder_number, src: WorkOrderNumber, rule: copy}       # nvarchar(100) NN -> text
+  - {dst: serial_number,    src: SerialNumber,    rule: copy}       # nvarchar -> text
+  - {dst: heat_code,        src: HeatCode,        rule: copy}       # nvarchar -> text
+  - {dst: supervisor_code,  src: SupervisorCode,  rule: copy}       # nvarchar -> text
+  - {dst: remarks,          src: Remarks,         rule: copy}       # nvarchar -> text
+  - {dst: action_taken,     src: ActionTaken,     rule: copy}       # nvarchar -> text
+  - {dst: is_modified,      src: IsModified,      rule: copy}       # bit -> boolean
+
+  # --- derived ---
+  - {dst: is_icd, src: null, rule: derived, name: is_icd}           # see derived_rules.is_icd; dbo.autodata_ICD is not used
+
+# Target columns not written by the migration
+defaults:
+  id: sequence autodata sequence                                       # generated by the target
+  cycletime_range: "GENERATED ALWAYS AS tsrange(mst_time, nd_time)"   # computed by Postgres; must never be inserted
+
+# Source columns with no target
+unmapped_source:
+  - id              # bigint NN - the target generates its own id (owner's decision); not stored
+  - SplString1      # nvarchar - no target column (confirmed by owner)
+  - SplString2      # nvarchar - no target column (confirmed by owner)
+
+derived_rules:
+  is_icd:
+    type: boolean
+    rule: |
+      true when ALL of these hold, otherwise false:
+        - the row has datatype = 2 (a down row), and
+        - the same machine (mc) has a datatype = 1 (cycle) row c where
+            DATEDIFF(second, c.sttime, c.ndtime) > c.cycletime
+            and a.sttime > c.sttime AND a.ndtime < c.ndtime
+    original_sql: |
+      CASE WHEN a.datatype = 2 AND EXISTS (
+              SELECT 1 FROM dbo.autodata c
+              WHERE c.mc = a.mc AND c.datatype = 1
+                AND DATEDIFF(second, c.sttime, c.ndtime) > c.cycletime
+                AND a.sttime > c.sttime AND a.ndtime < c.ndtime)
+           THEN 1 ELSE 0 END
+    same_rule_in: oee_validator/config/tables/autodata.yaml
+    implementation:
+      where: "SQL Server, inside each window's own query (same rule as the original SQL, so no timestamp emulation)"
+      direction: "the flag belongs to the DOWN row. A down row is tested against cycles that started before it, so a cycle in an earlier window is found through the lookback. Nothing looks forward."
+      lookback_seconds: "@L = the longest qualifying cycle (DATEDIFF(second, sttime, ndtime) > cycletime), measured once at the start of the run on the real source. Add: c.sttime < a.sttime AND c.sttime >= DATEADD(second, -@L, a.sttime). This never changes the result and lets the (mc, sttime) index do a seek."
+      qa_sample: "41 qualifying cycles, longest 23,092 s (6.41 h), 115 down rows. Production must be measured again."
+      index: "IX_MCSTTIME on (mc, sttime) exists in the source."
+      verify: "count of is_icd = true in Postgres equals the original rule run over the whole source table; then run oee_compare."
+      fallback: "if the source server is too busy, do the same in Polars: read the cycle rows for [start - @L, end) as a reference frame, join by machine, truncate both timestamps to whole seconds, apply the same conditions."
+    notes:
+      - "The matching cycle can start in an earlier window than the down row, so evaluate it against the whole table (or a lookback at least as long as the longest cycle), not only the rows of the current window."
+      - "DATEDIFF(second, ...) counts second boundaries crossed. A Polars version must truncate both timestamps to whole seconds before subtracting."
+      - "A NULL in sttime, ndtime or cycletime makes the test unknown, so the row gets false."
+      - "Check for an index on (mc, datatype, sttime) in SQL Server before choosing where to compute it."
+
+decisions:
+  - "dbo.autodata_ICD is NOT migrated; is_icd comes from derived_rules.is_icd. Confirmed by owner."
+  - "Source rows are not modified once the migration starts, so one pass per window is enough. Confirmed by owner."
+  - "Codes in autodata (mc, comp, opn, opr, dcode) are interface ids, so lookups match on interface_id; predefined down codes match on down_id. Taken from oee_compare/config/tables/autodata.yaml."
+  - "cycletime_range is generated by Postgres and is never written."
+  - "id is generated by the target sequence; the source id is not migrated. Confirmed by owner."
+  - "The iot ids (machine, component, operation, operator, down code) are resolved in the DataFrame, using the master_data tables read from Postgres. Confirmed by owner."
+  - "operation_iot_id is found by joining component_operation_pricing on machine_iot_id, component_iot_id and cop.interface_id = opn (the operation interface id), after the master tables are migrated. Confirmed by owner. A row whose combination does not exist gets NULL, and the original ids stay in component_interface_id and operation_interface_id."
+  - "SplString1 and SplString2 are not migrated. Confirmed by owner."
+  - "PartsCount, KWH and NetKWH have no values above 99999.99999, so numeric(10,5) is large enough. Confirmed by owner. The range check stays as a safety net: an out-of-range value would be listed in the exceptions report, not truncated."
+
+checks:
+  - "re-running a window must not duplicate rows"          # the target id is generated, so ids cannot detect a repeat. A window is loaded in ONE transaction that first deletes the target rows of that window (st_time in [start, end), or st_time IS NULL for the NULL window) and then inserts the batch (safe because the target is empty and nothing else writes to it)
+  - "lookup columns that find no match become NULL"        # all four iot id columns are nullable: the row is kept and the original interface ids stay in component_interface_id / operation_interface_id; the miss is listed in the exceptions report
+  - "mst_time is not later than nd_time"                   # the generated column tsrange(mst_time, nd_time) makes Postgres reject a row whose start is after its end; such a row cannot be loaded and is listed in the exceptions report
+  - "sum of rows over all windows (including the NULL window) equals COUNT(*) on the source"   # proves no row was skipped by the windows
+  - "part_count, kwh and net_kwh fit numeric(10,5)"        # an out-of-range value cannot be stored; it is listed in the exceptions report, never silently truncated
+
+  - "production_core.autodata is empty when the migration starts, and nothing else writes to it while it runs. Confirmed by owner. This is what makes it safe to redo a failed or repeated window by deleting that window's target rows (by st_time) before inserting again."

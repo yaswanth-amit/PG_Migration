@@ -1,0 +1,44 @@
+# Mapping: machineinformation (SQL Server) -> master_data.machine_module_settings (PostgreSQL)
+# Status: DRAFT - awaiting approval
+# Wave: 2 of lookup order. Depends on: machine_information (machine_iot_id lookup).
+# DERIVED table: there is no source table of this name. The module flags live on the machine row in the source,
+# so this is a second output from the same source table as machine_information.
+
+source:
+  database: TPM_PGSQL
+  schema: dbo
+  table: machineinformation
+  natural_key: [machineid]
+
+target:
+  schema: master_data
+  table: machine_module_settings
+  primary_key: [machine_iot_id]
+  foreign_keys:
+    - {columns: [machine_iot_id], references: machine_information(iot_id)}
+  unique: []
+
+depends_on: [machine_information]
+
+columns:
+  - {dst: machine_iot_id,             src: machineid, rule: lookup, table: machine_information, match: {machine_id: machineid}, on_miss: drop, return: iot_id}   # nvarchar(50) NN -> integer NN
+  - {dst: pp_enabled,                 src: PPEnabled,             rule: copy, null_as: ddl_default}   # bit      -> boolean; NULL becomes the DDL default (false)
+  - {dst: help_request_enabled,       src: HelpRequestEnabled,    rule: copy, null_as: ddl_default}   # bit      -> boolean; NULL becomes the DDL default (false)
+  - {dst: atwoc_enabled,              src: AtwocEnabled,          rule: copy, null_as: ddl_default}   # bit      -> boolean; NULL becomes the DDL default (false)
+  - {dst: eshopx_enabled,             src: EshopxEnabled,         rule: copy, null_as: ddl_default}   # bit      -> boolean; NULL becomes the DDL default (false)
+  - {dst: program_transfer_enabled,   src: ProgramTransferEnabled, rule: copy, null_as: ddl_default}  # bit      -> boolean; NULL becomes the DDL default (false)
+  - {dst: program_folders_enabled,    src: ProgramFoldersEnabled, rule: copy, null_as: ddl_default}   # bit NN   -> boolean; NULL becomes the DDL default (false)
+  - {dst: enable_part_count_by_macro, src: EnablePartCountByMacro, rule: bool, null_as: ddl_default}  # smallint -> boolean; 0 = false, non-zero = true, NULL becomes the DDL default (false)
+  - {dst: updated_at,                 src: UpdatedTS,             rule: coalesce, fallback: load_time}   # datetime (from the machine row) -> timestamp; NULL becomes load time
+
+# Source columns with no target: none from this group
+unmapped_source: []
+
+checks:
+  - "machine_iot_id is resolved for every row"   # on_miss: drop - a row whose machine is not present in machine_information is not migrated; it is listed in the exceptions report as dropped_no_parent (never silent)
+  - "one row per machine"                            # machineid is unique in the source, so this follows from the machine_information check
+
+decisions:
+  - "A NULL flag in the source becomes the DDL default (false); every flag column in the target defaults to false. Owner's rule: if NULL, use the DDL default, else keep NULL."
+  - "updated_at uses the machine row's UpdatedTS; NULL becomes the DDL default (CURRENT_TIMESTAMP)."
+  - "Every machine gets a row, even if all its flags are NULL or false. Confirmed by owner."

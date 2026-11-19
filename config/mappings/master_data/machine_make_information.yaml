@@ -1,0 +1,43 @@
+# Mapping: machinemakeinformation (SQL Server) -> master_data.machine_make_information (PostgreSQL)
+# Status: DRAFT - awaiting approval
+# Wave: 3 of lookup order. Depends on: machine_information.
+# Conventions (null handling, no dropped rows, updated_at, lookups): see _conventions.yaml
+
+source:
+  database: TPM_PGSQL
+  schema: dbo
+  table: machinemakeinformation
+  natural_key: [machineid]
+
+target:
+  schema: master_data
+  table: machine_make_information
+  primary_key: []                # none; machine_iot_id is UNIQUE instead
+  unique: [[machine_iot_id]]     # UNIQUE (machine_iot_id)
+  foreign_keys:
+    - {columns: [machine_iot_id], references: machine_information(iot_id)}
+
+depends_on: [machine_information]
+
+columns:
+  - {dst: machine_iot_id,      src: machineid,        rule: lookup, table: machine_information, match: {machine_id: machineid}, on_miss: drop, return: iot_id}   # nvarchar(50) NN -> integer; a row whose machine is not in machine_information is NOT migrated (owner's decision); it is listed as dropped_no_parent
+  - {dst: manufacturer,        src: manufacturer,     rule: copy}                   # nvarchar(100)   -> text
+  - {dst: date_of_manufacture, src: dateofmanufacture, rule: cast, to: date}        # smalldatetime   -> date (the time part is dropped)
+  - {dst: address,             src: address,          rule: copy}                   # nvarchar(100)   -> text
+  - {dst: place,               src: place,            rule: copy}                   # nvarchar(100)   -> text
+  - {dst: phone,               src: phone,            rule: copy}                   # nvarchar(50)    -> text
+  - {dst: contact_person,      src: contactperson,    rule: copy}                   # nvarchar(100)   -> text
+
+# Target columns with no source: not written by the migration
+defaults:
+  updated_at: CURRENT_TIMESTAMP      # column default; source has no UpdatedTS
+
+# Source columns with no target: none
+unmapped_source: []
+
+checks:
+  - "MachineID has a match in machine_information"   # on_miss: drop - a row whose machine is not present in machine_information is not migrated; it is listed in the exceptions report as dropped_no_parent (never silent)
+  - "machine_iot_id is unique"                       # target UNIQUE constraint: a second row for the same machine cannot be loaded; it is listed in the exceptions report. Several NULLs are allowed.
+
+decisions:
+  - "Only machines that exist in machine_information are migrated; a machine_make row for any other machine is dropped (on_miss: drop). Confirmed by owner on 2026-11-19. This is a deliberate exception to the 'no row dropped' convention: the dropped rows are still listed with the reason dropped_no_parent, so a drop is never silent. In the QA source this applies to the machine MC-03, which is not in machineinformation."

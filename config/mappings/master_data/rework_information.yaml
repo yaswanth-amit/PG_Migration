@@ -1,0 +1,36 @@
+# Mapping: Reworkinformation (SQL Server) -> master_data.rework_information (PostgreSQL)
+# Status: DRAFT - awaiting approval
+# Wave: 1 of lookup order (no dependencies)
+
+source:
+  database: TPM_PGSQL
+  schema: dbo
+  table: Reworkinformation
+  natural_key: [Reworkno]
+
+target:
+  schema: master_data
+  table: rework_information
+  primary_key: [rework_no]       # has default sequence rework_information_rework_no_seq, but the source value is supplied
+  unique: []
+
+columns:
+  - {dst: rework_no,           src: Reworkno,          rule: copy}   # int NN         -> integer NN (primary key, source value kept)
+  - {dst: rework_id,           src: Reworkid,          rule: copy}   # nvarchar(50) NN -> text NN
+  - {dst: rework_description,  src: Reworkdescription, rule: copy}   # nvarchar(100)  -> text
+  - {dst: rework_catagory,     src: ReworkCatagory,    rule: copy}   # nvarchar(50)   -> text  (spelling "catagory" matches both source and target)
+  - {dst: rework_interface_id, src: Reworkinterfaceid, rule: copy}   # nvarchar(50)   -> text
+  - {dst: updated_at,          src: UpdatedTS,         rule: copy}   # datetime -> timestamp; the column has no DDL default, so NULL stays NULL
+
+# Target columns with no source: not written by the migration
+defaults:
+  is_active: "true"                  # column default
+
+# Source columns with no target: none
+unmapped_source: []
+
+post_load:
+  - "Advance sequence rework_information_rework_no_seq to MAX(rework_no), because primary key values are copied from the source and the sequence would otherwise start at 1 and collide on the next insert."
+
+checks:
+  - rework_no is NOT NULL and unique      # primary key: a duplicate cannot be loaded; it is listed in the exceptions report, never silently dropped

@@ -1,0 +1,39 @@
+# Mapping: TPMWEB_EfficiencyColorCoding (SQL Server) -> master_data.tpmweb_efficiency_color_coding (PostgreSQL)
+# Status: DRAFT - awaiting approval
+# Wave: 1 of lookup order (no dependencies)
+
+source:
+  database: TPM_PGSQL
+  schema: dbo
+  table: TPMWEB_EfficiencyColorCoding
+  natural_key: [Type]
+
+target:
+  schema: master_data
+  table: tpmweb_efficiency_color_coding
+  primary_key: [type]
+  unique: []
+
+columns:
+  - {dst: type,      src: Type,      rule: copy}                                # nvarchar(50) NN -> text NN (primary key)
+  - {dst: pe_green,  src: PEGreen,   rule: cast, to: integer, range_check: true}   # bigint NN -> integer NN
+  - {dst: pe_red,    src: PERed,     rule: cast, to: integer, range_check: true}   # bigint NN -> integer NN
+  - {dst: ae_green,  src: AEGreen,   rule: cast, to: integer, range_check: true}   # bigint NN -> integer NN
+  - {dst: ae_red,    src: AERed,     rule: cast, to: integer, range_check: true}   # bigint NN -> integer NN
+  - {dst: oee_green, src: OEEGreen,  rule: cast, to: integer, range_check: true}   # bigint NN -> integer NN
+  - {dst: oee_red,   src: OEERed,    rule: cast, to: integer, range_check: true}   # bigint NN -> integer NN
+  - {dst: qe_green,  src: QEGreen,   rule: cast, to: integer, range_check: true}   # bigint NN -> integer NN
+  - {dst: qe_red,    src: QERed,     rule: cast, to: integer, range_check: true}   # bigint NN -> integer NN
+  - {dst: opr_green, src: OPRGreen,  rule: cast, to: integer, range_check: true}   # bigint    -> integer (nullable)
+  - {dst: opr_red,   src: OPRRed,    rule: cast, to: integer, range_check: true}   # bigint    -> integer (nullable)
+
+# Target columns with no source: not written by the migration
+defaults:
+  updated_at: CURRENT_TIMESTAMP      # column default; source has no UpdatedTS
+
+# Source columns with no target: none
+unmapped_source: []
+
+checks:
+  - type is NOT NULL and unique                            # primary key: a duplicate cannot be loaded; it is listed in the exceptions report, never silently dropped
+  - all numeric columns fit in integer (-2147483648..2147483647)   # bigint -> integer narrowing; an out-of-range value cannot be stored in integer, so it is listed in the exceptions report, not silently truncated

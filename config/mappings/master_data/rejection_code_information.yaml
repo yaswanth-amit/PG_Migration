@@ -1,0 +1,43 @@
+# Mapping: rejectioncodeinformation (SQL Server) -> master_data.rejection_code_information (PostgreSQL)
+# Status: DRAFT - awaiting approval
+# Wave: 1 of lookup order (no dependencies)
+
+source:
+  database: TPM_PGSQL
+  schema: dbo
+  table: rejectioncodeinformation
+  natural_key: [rejectionno]
+
+target:
+  schema: master_data
+  table: rejection_code_information
+  primary_key: [rejection_number]   # has default sequence rejection_code_information_rejection_number_seq, but the source value is supplied
+  unique: []
+
+columns:
+  - {dst: rejection_number,                  src: rejectionno,          rule: copy}   # int NN          -> integer NN (primary key, source value kept)
+  - {dst: rejection_id,                      src: rejectionid,          rule: copy}   # nvarchar(50) NN -> text NN
+  - {dst: interface_id,                      src: interfaceid,          rule: coalesce, fallback_col: rejectionid}   # nvarchar(50) -> text NN; target NOT NULL, so NULL becomes rejectionid
+  - {dst: rejection_description,             src: rejectiondescription, rule: copy}   # nvarchar(100)   -> text
+  - {dst: category,                          src: Catagory,             rule: copy}   # nvarchar(50)    -> text  (source spelling "Catagory")
+  - {dst: sub_category,                      src: SubCategory,          rule: copy}   # nvarchar(50)    -> text
+  - {dst: rejection_description_hindi,       src: RejDescriptionHindi,  rule: copy}   # nvarchar(100)   -> text
+  - {dst: rejection_description_in_seclang,  src: RejDescInSecLang,     rule: copy}   # nvarchar(100)   -> text
+  - {dst: updated_at,                        src: UpdatedTS,            rule: copy}   # datetime -> timestamp; the column has no DDL default, so NULL stays NULL
+
+# Target columns with no source: not written by the migration
+defaults:
+  is_active: "true"                  # column default
+
+# Source columns with no target: none
+unmapped_source: []
+
+post_load:
+  - "Advance sequence rejection_code_information_rejection_number_seq to MAX(rejection_number)."
+
+checks:
+  - rejection_number is NOT NULL and unique     # primary key: a duplicate cannot be loaded; it is listed in the exceptions report, never silently dropped
+  - interface_id is NOT NULL after the fallback    # still NULL only if both interfaceid and rejectionid are NULL (rejectionid is NOT NULL in source, so not expected)
+
+decisions:
+  - "interface_id = COALESCE(interfaceid, rejectionid). Confirmed by owner."

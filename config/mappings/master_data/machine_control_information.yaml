@@ -1,0 +1,46 @@
+# Mapping: MachineControlInformation (SQL Server) -> master_data.machine_control_information (PostgreSQL)
+# Status: DRAFT - awaiting approval
+# Wave: 3 of lookup order. Depends on: machine_information.
+# Conventions (null handling, no dropped rows, updated_at, lookups): see _conventions.yaml
+
+source:
+  database: TPM_PGSQL
+  schema: dbo
+  table: MachineControlInformation
+  natural_key: [MachineId]
+
+target:
+  schema: master_data
+  table: machine_control_information
+  primary_key: [machine_iot_id]
+  unique: []
+  foreign_keys:
+    - {columns: [machine_iot_id], references: machine_information(iot_id)}
+
+depends_on: [machine_information]
+
+columns:
+  - {dst: machine_iot_id,               src: MachineId, rule: lookup, table: machine_information, match: {machine_id: MachineId}, on_miss: drop, return: iot_id}   # nvarchar(50) NN -> integer NN
+  - {dst: control_name,                 src: ControlName,              rule: copy}   # nvarchar(50)  -> text
+  - {dst: p_start_id,                   src: pStartId,                 rule: copy}   # nvarchar(10)  -> text
+  - {dst: p_end_id,                     src: pEndId,                   rule: copy}   # nvarchar(10)  -> text
+  - {dst: receive_at_machine_file_path, src: ReceiveAtMachineFilePath, rule: copy}   # nvarchar(255) -> text
+  - {dst: sent_from_machine_file_path,  src: SentFromMachineFilePath,  rule: copy}   # nvarchar(255) -> text
+
+# Target columns with no source: not written by the migration
+defaults:
+  updated_at: CURRENT_TIMESTAMP      # column default; source has no UpdatedTS
+
+# Source columns with no target
+unmapped_source:
+  - FileNameFrom    # int - no target column
+
+checks:
+  - "machine_iot_id is resolved for every row"   # on_miss: drop - a row whose machine is not present in machine_information is not migrated; it is listed in the exceptions report as dropped_no_parent (never silent)
+  - "machine_iot_id is unique"                   # primary key: a second row for the same machine cannot be loaded; it is listed in the exceptions report
+
+decisions:
+  - "FileNameFrom (int) has no target column and is intentionally not migrated. Confirmed by owner."
+
+notes:
+  - "The source table has 0 rows in TPM_PGSQL, so real values could not be checked."

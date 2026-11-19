@@ -1,0 +1,43 @@
+# Mapping: EfficiencyTarget (SQL Server) -> master_data.efficiency_target (PostgreSQL)
+# Status: DRAFT - awaiting approval
+# Wave: 2 of lookup order. Depends on: machine_information (machine_iot_id lookup).
+
+source:
+  database: TPM_PGSQL
+  schema: dbo
+  table: EfficiencyTarget
+  natural_key: [MachineID, StartDate, EndDate, TargetLevel]
+
+target:
+  schema: master_data
+  table: efficiency_target
+  primary_key: [machine_iot_id, start_date, end_date, target_level]
+  unique: []
+
+depends_on: [machine_information]
+
+columns:
+  - {dst: machine_iot_id,     src: MachineID,       rule: lookup, table: machine_information, match: {machine_id: MachineID}, on_miss: drop, return: iot_id}   # nvarchar(50) NN -> integer NN (part of primary key)
+  - {dst: start_date,         src: StartDate,       rule: copy}      # datetime NN -> timestamp without time zone NN (part of primary key)
+  - {dst: end_date,           src: EndDate,         rule: copy}      # datetime NN -> timestamp without time zone NN (part of primary key)
+  - {dst: ae,                 src: AE,              rule: copy}      # smallint    -> smallint
+  - {dst: pe,                 src: PE,              rule: copy}      # smallint    -> smallint
+  - {dst: qe,                 src: QE,              rule: copy}      # smallint    -> smallint
+  - {dst: oe,                 src: OE,              rule: copy}      # smallint    -> smallint
+  - {dst: logical_day_start,  src: LogicalDayStart, rule: copy}      # datetime    -> timestamp without time zone
+  - {dst: logical_day_end,    src: LogicalDayEnd,   rule: copy}      # datetime    -> timestamp without time zone
+  - {dst: target_level,       src: TargetLevel,     rule: trim}      # char(10) NN -> text NN (part of primary key); trailing spaces removed
+
+# Target columns with no source: not written by the migration
+defaults:
+  updated_at: CURRENT_TIMESTAMP      # column default; source has no UpdatedTS
+
+# Source columns with no target: none
+unmapped_source: []
+
+checks:
+  - "machine_iot_id is resolved for every row"   # on_miss: drop - a row whose machine is not present in machine_information is not migrated; it is listed in the exceptions report as dropped_no_parent (never silent)
+  - "(machine_iot_id, start_date, end_date, target_level) is unique"   # primary key; target_level is trimmed first, so 'Daily    ' and 'Daily' would collide and the second cannot be loaded; it is listed in the exceptions report
+
+notes:
+  - "In the target, machine_iot_id has a default of nextval('master_data.efficiency_target_machine_iot_id_seq'). That looks like a schema mistake, since the value must be the machine's iot_id. The migration always supplies the value, so the default is never used, but the owner of the target schema should consider removing it."

@@ -1,0 +1,69 @@
+# Conventions shared by every table mapping in config/mappings/master_data
+# These are owner decisions. A table file only mentions them where it deviates.
+# Status: DRAFT - maintained as decisions are made
+
+rules:
+  no_rows_dropped:
+    behaviour: "every source row is loaded. A row is never skipped because of a NULL, a missing column or an unmatched lookup."
+    only_exception: "a row that the target database itself cannot store (duplicate primary key or UNIQUE value, NOT NULL column with no fallback, value out of range for the column type). It is not silently dropped: it is listed in an exceptions report with the reason, so it can be fixed and loaded later."
+    decided: "owner, after down_code_information"
+
+  null_values:
+    behaviour: "if a source value is NULL: use the column's DDL default when the target column has one; otherwise keep NULL"
+    notes:
+      - "applies to every mapped column in every table"
+      - "the DDL defaults were read from tpm_baseline_qa.master_data, for example is_active = true, is_admin = false, sort_order = 0, shift_details.from_day = 0, machine_module_settings flags = false, updated_at = CURRENT_TIMESTAMP"
+      - "this replaces the earlier 'keep NULL' answer for shift_details; shift_details is updated"
+    explicit_overrides_in_table_files:
+      - "interface_id and name fallbacks (NOT NULL target columns), see interface_id below"
+      - "employee_information.status: 1 = Active, anything else = Inactive"
+      - "updated_by: 'pct', see below"
+      - "created_at / valid_from: load time rules written in their table files"
+
+  missing_source_column:
+    applies_to: "a target column with no matching source column"
+    behaviour: "omit the column from the load, so the DDL default applies; if the DDL has no default, the value is NULL"
+    decided: "owner, on down_code_information"
+
+  updated_at:
+    behaviour: "from the source UpdatedTS when there is one; a NULL follows the null_values rule (DDL default CURRENT_TIMESTAMP where the column has one, otherwise NULL)"
+    tables_without_ddl_default: [machine_information, employee_roles_master, rework_information, rejection_code_information, shift_hour_definition, shift_details, plant_machine, plant_machine_groups]
+    note: "for these tables a NULL UpdatedTS now stays NULL. Earlier drafts used load time; change back only if the owner wants it."
+
+  is_active:
+    meaning: "soft-delete flag in the new design. Source rows are never deleted, so every migrated row is active."
+    behaviour: "the source has no equivalent, so the DDL default (true) applies; is_active is never derived from dates or status columns"
+    decided: "owner, on plant_machine. Applies to every table with is_active (employee_information, component_information, down_category, down_code_information, customer_information, component_operation_pricing, rejection_code_information, rework_information, plant_machine)."
+
+  updated_by:
+    behaviour: "COALESCE(source value, 'pct'); a constant 'pct' when the source has no column"
+    note: "explicit owner rule; it takes precedence over null_values for this column"
+
+  interface_id:
+    behaviour: "COALESCE(source InterfaceID, the table's own identifier), applied where the target column is NOT NULL"
+    tables: [employee_information, rejection_code_information, machine_information, component_information, down_code_information]
+
+  lookups:
+    behaviour: "a natural key is resolved to iot_id. A NULL key stays NULL. A non-NULL key with no match becomes NULL where the target column is nullable (the row is kept and reported). Where the target column is NOT NULL, the row cannot be stored and goes to the exceptions report."
+    note: "the owner says unmatched keys do not occur for MachineID, EmployeeID and InterfaceID"
+    on_miss: >
+      on_miss: drop on a lookup means a row whose key has no match is NOT migrated; it is listed as
+      dropped_no_parent, so a drop is never silent. Owner decision 2026-11-19 for every lookup of a machine
+      (machine_make_information, holiday_list, plant_machine_groups, component_operation_pricing,
+      machine_control_information, machine_module_settings, efficiency_target). plant_machine and
+      scheduled_reports keep the default.
+    report_miss: "report_miss: false keeps the NULL but does not count or warn about the miss (component_information.customer_iot_id)."
+
+  boolean_from_number:
+    behaviour: "0 = false, non-zero = true; NULL follows the null_values rule"
+
+  source_row_numbers:
+    behaviour: "source row-number columns (SlNo / slno) are not migrated. The target generates iot_id / id from its sequence."
+    exceptions: "primary keys that carry business meaning are copied: rework_information.rework_no, rejection_code_information.rejection_number. After copying, advance the sequence to MAX(id)."
+    decided: "owner, on plant_employee and shift_details"
+
+  validation_checks:
+    behaviour: "checks on columns that have no target constraint (for example company_name unique) only report; the rows are still loaded"
+
+  exceptions_report:
+    behaviour: "rows listed here include the table, the key, the column and the reason. Values of sensitive columns (for example upassword) are never written to it."

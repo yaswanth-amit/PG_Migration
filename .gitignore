@@ -1,0 +1,22 @@
+# Secrets: never commit. Passwords live in .env or in environment variables.
+.env
+.env.*
+*.pem
+*.pfx
+*.key
+
+# Run output: logs, progress files, and exception reports (they hold natural keys of customer data)
+logs/
+reports/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Tools and editors
+.playwright-mcp/
+.vscode/
+*.tmp

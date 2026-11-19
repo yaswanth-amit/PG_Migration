@@ -1,0 +1,13 @@
+# config/connections.yaml
+source:
+  driver: "ODBC Driver 17 for SQL Server"
+  server: localhost
+  database: TPM_PGSQL
+  user_env: SRC_DB_USER        # name of the env var, not the value
+  password_env: SRC_DB_PASSWORD
+target:
+  host: localhost
+  port: 5433
+  database: tpm_migration
+  user_env: TGT_DB_USER
+  password_env: TGT_DB_PASSWORD
