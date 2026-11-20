@@ -15,6 +15,7 @@ from unittest import mock
 
 import polars as pl
 
+from pipeline import batching
 from pipeline import extract as ex
 from pipeline import load as ld
 from pipeline import log_setup
@@ -26,7 +27,7 @@ from pipeline.transform import TransformResult
 MS = load_mappings()
 COP = "component_operation_pricing"
 AUTODATA_PARENTS = {"machine_information", "component_information", COP, "employee_information",
-                    "down_code_information"}
+                    "down_code_information", "shift_details"}
 JAN1, JAN16, JAN31 = datetime(2026, 1, 1), datetime(2026, 1, 16), datetime(2026, 1, 31)
 
 
@@ -95,6 +96,7 @@ class Harness:
         self.rows_loaded = rows_loaded
         self.combined_count = combined_count
         self.fail_references = fail_references
+        self.icd_cycle_calls, self.logical_calls = [], []
         self.target_has_window = True       # does the target still hold rows of a window the history calls completed?
         self.tgt = FakeTgt()
         self.cache = mock.MagicMock()
@@ -130,7 +132,9 @@ class Harness:
         return summary
 
     def count_source_rows(self, conn, m, where=None, params=()):
-        return self.combined_count if where and " OR " in where else 2
+        if where is None:                                   # the whole table: only the windowed table is counted in windows
+            return self.combined_count if m.name == "autodata" else 2
+        return self.combined_count if " OR " in where else 2
 
     def write_table_result(self, conn, run_id, name, rows_read, rows_loaded, rows_excepted, misses=None, file=None):
         self.hook_calls.append(("table", name, rows_read, rows_loaded))
@@ -146,6 +150,14 @@ class Harness:
     def window_has_rows(self, conn, m, start, end):
         return self.target_has_window
 
+    def batch_icd_cycles(self, conn, m, machines, start, end, lookback):
+        self.icd_cycle_calls.append((list(machines), start, end, lookback))
+        return pl.DataFrame()
+
+    def logical_windows(self, conn, low, high, start=None, end=None, months=1, include_null_window=True):
+        self.logical_calls.append((low, high, start, end, months))
+        return ex.generate_windows(JAN1, datetime(2026, 1, 20), 15, include_null_window=include_null_window)
+
     def assert_target_empty(self, conn, schema, table):
         self.asserted_empty.append(table)
 
@@ -160,7 +172,9 @@ class Harness:
             stack.enter_context(mock.patch.object(ex, "source_time_range", lambda *a: (JAN1, JAN31 - (JAN31 - datetime(2026, 1, 20)))))
             stack.enter_context(mock.patch.object(ex, "count_source_rows", self.count_source_rows))
             stack.enter_context(mock.patch.object(ex, "compute_icd_lookback", lambda *a: 100))
-            stack.enter_context(mock.patch.object(ex, "extract_all_icd_cycles", lambda *a: pl.DataFrame()))
+            stack.enter_context(mock.patch.object(ex, "list_machines", lambda *a: ["M1", "M2"]))
+            stack.enter_context(mock.patch.object(ex, "extract_batch_icd_cycles", self.batch_icd_cycles))
+            stack.enter_context(mock.patch.object(batching, "logical_month_windows", self.logical_windows))
             stack.enter_context(mock.patch.object(ld, "load_table", self.load_table))
             stack.enter_context(mock.patch.object(ld, "load_window", self.load_window))
             stack.enter_context(mock.patch.object(ld, "assert_target_empty", self.assert_target_empty))
@@ -339,6 +353,38 @@ def test_history_is_not_trusted_when_the_target_no_longer_holds_the_window():
     h.run(["autodata"], mode="real", tracker=autodata_tracker(windows={(JAN1, JAN16)}))
     assert [w[0] for w in h.windows_loaded] == [1, 2, 3]
     assert h.asserted_empty == ["autodata"]
+
+
+def test_autodata_batches_are_logical_months_by_default_and_fixed_days_when_asked():
+    h = Harness()
+    h.run(["autodata"], tracker=autodata_tracker())
+    assert len(h.logical_calls) == 1 and h.logical_calls[0][4] == 1            # one logical month per batch
+    d = Harness()
+    d.run(["autodata"], tracker=autodata_tracker(), days=7)
+    assert d.logical_calls == []                                               # --days: fixed windows, the earlier way
+    assert d.tracker.of("plan_windows")[0][3][0] == (JAN1, datetime(2026, 1, 8))
+
+
+def test_the_candidate_cycles_are_read_for_each_batch_with_its_own_start_and_end():
+    h = Harness()
+    h.run(["autodata"], tracker=autodata_tracker())
+    assert [(c[1], c[2]) for c in h.icd_cycle_calls] == [(JAN1, JAN16), (JAN16, JAN31), (None, None)]
+    assert all(c[0] == ["M1", "M2"] and c[3] == 100 for c in h.icd_cycle_calls)
+
+
+def test_progress_totals_still_known_when_the_logical_windows_cannot_be_planned_yet():
+    """The windows need shift_details, which the same run loads later: the total is estimated from the table
+    instead of becoming unknown (which made the page fall back to counting tables)."""
+    def cannot_plan(*a, **k):
+        raise ValueError("no running shift")
+    counted = []
+    def count(conn, m, where=None, params=()):
+        counted.append(where)
+        return 1234
+    opts = runner.RunOptions(tables=["autodata"])
+    with mock.patch.object(batching, "logical_month_windows", cannot_plan),          mock.patch.object(ex, "source_time_range", lambda *a: (JAN1, JAN31)),          mock.patch.object(ex, "count_source_rows", count):
+        totals = runner._plan_totals(MS, ["autodata"], opts, object(), object(), None, False)
+    assert totals == {"autodata": 1234}
 
 
 def test_resume_can_be_switched_off():

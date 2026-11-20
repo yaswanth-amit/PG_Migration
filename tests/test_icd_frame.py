@@ -1,5 +1,5 @@
 """Tests for the in-DataFrame is_icd rule (extract.add_is_icd): it must give exactly the answer of the SQL rule
-(extract.is_icd_sql). No database is used; a plain-Python version of the SQL rule is the reference.
+(the s_GetCockpitData rule). No database is used; a plain-Python version of the SQL rule is the reference.
 Run with:  python -m pytest tests/test_icd_frame.py
 """
 import random
@@ -105,10 +105,3 @@ def test_random_data_gives_the_same_answer_as_the_sql_rule():
             items.append((rnd.choice(machines), rnd.choice([1, 2, 2]), start, end))
         batch = rows(*items)
         assert flagged(batch, cyc) == reference(batch, cyc)
-
-
-def test_extract_batches_without_in_frame_icd_leaves_is_icd_out_of_the_sql():
-    from pipeline.mapping_config import load_mappings
-    m = load_mappings().tables["autodata"]
-    assert "EXISTS" in ex.build_select_sql(m, icd_lookback_seconds=10)
-    assert "EXISTS" not in ex.build_select_sql(m, icd_in_frame=True)

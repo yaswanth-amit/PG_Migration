@@ -11,11 +11,17 @@ import pandas as pd
 import streamlit as st
 
 from pipeline import services, ui_components as ui
+from pipeline import mapping_overrides as mo
 from pipeline.mapping_config import load_mappings
 from pipeline.planner import plan_run, validate_selection, with_dependencies
 
 st.set_page_config(page_title="TPM Data Migration", page_icon="🚀", layout="wide")
 st.markdown(ui.CSS, unsafe_allow_html=True)
+
+
+@st.cache_resource
+def get_reviewed():
+    return mo.load_reviewed()
 
 
 @st.cache_resource
@@ -187,8 +193,11 @@ with tab_migrate:
         start_day = w2.date_input("From", value=low_day or date.today(), key="from_day", disabled=not limit)
         end_day = w3.date_input("To", value=high_day or date.today(), key="to_day", disabled=not limit)
         if low_day and high_day:
-            st.caption(f"The source holds autodata from **{low_day}** to **{high_day}**.")
-        days = int(w4.number_input("Days per window", min_value=1, max_value=365, value=15, key="days"))
+            st.caption(f"The source holds autodata from **{low_day}** to **{high_day}**. "
+                       "From and To are logical days: From starts at the first shift, To ends with the last shift of that day.")
+        days = int(w4.number_input("Days per window (0 = logical months)", min_value=0, max_value=365, value=0, key="days",
+                                   help="0: one batch per logical month, cut at the logical-day start (recommended). "
+                                        "A number: fixed windows of that many days."))
         w5, w6, _ = st.columns([2, 2, 4])
         max_windows = int(w5.number_input("Only the first N windows (0 = all)", min_value=0, max_value=5000,
                                           value=0 if real else 2, key="max_windows"))
@@ -297,9 +306,113 @@ with tab_mapping:
                 f"`{(m.raw.get('target') or {}).get('schema', '')}.{m.tgt_table}`")
     st.caption("Needs: " + (", ".join(sorted(set(m.depends_on))) or "nothing"))
 
+    reviewed = get_reviewed().tables[choice]            # the reviewed mapping, without user choices
+    saved = mo.load_override(choice)
+    src_cols, src_err = services.fetch_source_columns(reviewed)
+    tgt_cols, tgt_err = services.fetch_target_columns(reviewed)
+
+    st.markdown("##### Reviewed mapping (cannot be changed here)")
     frame = pd.DataFrame([{"target column": c.dst, "source column": c.src or "", "rule": c.rule,
-                           "details": json.dumps(c.params, default=str) if c.params else ""} for c in m.columns])
+                           "details": json.dumps(c.params, default=str) if c.params else ""} for c in reviewed.columns])
     st.dataframe(frame, hide_index=True)
+
+    if src_err or tgt_err:
+        st.info((src_err or "") + " " + (tgt_err or "") + " Column types and your choices need both databases.")
+    else:
+        src_rows = mo.classify_source(reviewed, src_cols, saved)
+        tgt_rows = mo.classify_target(reviewed, tgt_cols, saved)
+        left_a, left_b = st.columns(2)
+        with left_a:
+            st.markdown("##### SQL Server columns")
+            st.dataframe(pd.DataFrame([{"column": r["name"], "type": r["type_text"],
+                                        "null": "NULL" if r["nullable"] else "NOT NULL",
+                                        "status": r["status"], "note": r["note"]} for r in src_rows]), hide_index=True)
+        with left_b:
+            st.markdown("##### PostgreSQL columns")
+            st.dataframe(pd.DataFrame([{"column": r["name"], "type": r["pg_type"],
+                                        "null": "NULL" if r["nullable"] else "NOT NULL",
+                                        "default": r["default"], "status": r["status"],
+                                        "value comes from": r["how"]} for r in tgt_rows]), hide_index=True)
+
+        open_src = [r for r in src_rows if r["status"] == mo.UNDECIDED]
+        open_tgt = [r for r in tgt_rows if r["status"] in ("no value yet", "database default")]
+        no_value = [r["name"] for r in tgt_rows if r["status"] == "no value yet" and not r["nullable"] and not r["default"]]
+        if no_value:
+            st.warning("NOT NULL target columns with no value yet (rows would go to the exceptions report): "
+                       + ", ".join(no_value))
+
+        st.markdown("##### Your choices (they only fill gaps)")
+        src_by_name = {r["name"]: r for r in src_cols}
+        draft = {"columns": list(saved.get("columns", [])), "leave_unmapped": list(saved.get("leave_unmapped", []))}
+        tgt_names = [r["name"] for r in open_tgt]
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**A source column with no target**")
+            if not open_src:
+                st.caption("No undecided source columns.")
+            else:
+                pick = st.selectbox("Source column", [r["name"] for r in open_src], key=f"s_{choice}")
+                what = st.radio("What to do", ["Map to a target column", "Leave it unmapped"], key=f"sw_{choice}")
+                if what.startswith("Map"):
+                    target = st.selectbox("Target column", tgt_names, key=f"st_{choice}")
+                    if target and st.button("Add this mapping", key=f"sa_{choice}"):
+                        verdict, rule, msg = mo.compatibility(src_by_name[pick]["type"], tgt_cols[target].pg_type)
+                        choice_row = {"dst": target, "src": pick, "rule": rule or "copy"}
+                        if rule == "cast":
+                            choice_row["to"] = tgt_cols[target].pg_type
+                        draft["columns"].append(choice_row)
+                        problems = mo.validate_override(reviewed, draft, src_cols, tgt_cols)
+                        if problems:
+                            st.error("\n\n".join(problems))
+                        else:
+                            mo.save_override(choice, draft, "ui"); get_mappings.clear(); get_reviewed.clear()
+                            st.success(msg or "Saved."); st.rerun()
+                elif st.button("Leave it unmapped", key=f"sl_{choice}"):
+                    draft["leave_unmapped"].append(pick)
+                    mo.save_override(choice, draft, "ui"); get_mappings.clear(); get_reviewed.clear(); st.rerun()
+        with c2:
+            st.markdown("**A target column with no value**")
+            if not tgt_names:
+                st.caption("No open target columns.")
+            else:
+                target = st.selectbox("Target column", tgt_names, key=f"t_{choice}")
+                kind = st.selectbox("Fill it with", ["Load time", "Constant", "NULL", "Database default",
+                                                     "A source column"], key=f"tk_{choice}")
+                new = {"dst": target}
+                if kind == "Load time":
+                    new["rule"] = "load_time"
+                elif kind == "NULL":
+                    new["rule"] = "set_null"
+                elif kind == "Database default":
+                    new["rule"] = "omit"
+                elif kind == "Constant":
+                    new["rule"] = "constant"
+                    new["value"] = st.text_input("Value", key=f"tv_{choice}")
+                else:
+                    options = [r["name"] for r in open_src]
+                    source = st.selectbox("Source column", options, key=f"ts_{choice}") if options else None
+                    if source:
+                        verdict, rule, _ = mo.compatibility(src_by_name[source]["type"], tgt_cols[target].pg_type)
+                        new.update({"rule": rule or "copy", "src": source})
+                        if rule == "cast":
+                            new["to"] = tgt_cols[target].pg_type
+                if st.button("Add this value", key=f"ta_{choice}") and "rule" in new:
+                    draft["columns"].append(new)
+                    problems = mo.validate_override(reviewed, draft, src_cols, tgt_cols)
+                    if problems:
+                        st.error("\n\n".join(problems))
+                    else:
+                        mo.save_override(choice, draft, "ui"); get_mappings.clear(); get_reviewed.clear(); st.rerun()
+
+        if saved.get("columns") or saved.get("leave_unmapped"):
+            st.markdown("**Saved choices for this table**")
+            items = [f"{c['dst']} ← {mo.describe_rule(c)}" for c in saved.get("columns", [])]
+            items += [f"{n}: left unmapped" for n in saved.get("leave_unmapped", [])]
+            for item in items:
+                st.markdown(f"- {item}")
+            if st.button("Reset my choices for this table", key=f"reset_{choice}"):
+                mo.save_override(choice, {}, "ui"); get_mappings.clear(); get_reviewed.clear(); st.rerun()
 
     if m.default:
         st.markdown("**Filled by the database (not written by the migration)**")

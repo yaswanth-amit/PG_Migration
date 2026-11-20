@@ -7,11 +7,12 @@ A real run commits table by table (and window by window for autodata).
 """
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import polars as pl
 
+from pipeline import batching
 from pipeline import extract as ex
 from pipeline import load as ld
 from pipeline import tracking
@@ -20,6 +21,7 @@ from pipeline.lookups import LookupCache
 from pipeline.mapping_config import MappingSet, TableMapping, table_dependencies
 from pipeline.planner import plan_run, validate_selection
 from pipeline.progress import NULL_PROGRESS
+from pipeline.schema_adapt import adapt_to_source, list_source_columns
 from pipeline.target_schema import read_target_schema
 from pipeline.transform import TransformContext, transform_batch
 
@@ -58,6 +60,7 @@ class TableOutcome:
     windows_total : int = 0
     seconds : float = 0.0
     error : str | None = None
+    adapted : list = field(default_factory=list)   # rules left out because the source table lacks a column
 
 
 @dataclass
@@ -205,6 +208,14 @@ def run_migration(ms : MappingSet , options : RunOptions , src_conn , tgt_conn ,
                         target_schema=read_target_schema(tgt_conn, schema_name, m.tgt_table),
                         lookups=cache, references=references)
 
+                    # leave out rules whose source column this source database does not have
+                    m, adaptation = adapt_to_source(m, list_source_columns(src_conn, m), ctx.target_schema)
+                    for note in adaptation.notes:
+                        log.warning("mapping adapted: %s", note)
+                    outcome.adapted = adaptation.dropped
+                    if adaptation.blockers:
+                        raise ValueError("; ".join(adaptation.blockers))
+
                     if "batching" in m.raw:
                         _run_window_table(m, ctx, outcome, options, src_conn, tgt_conn, tracker, run_id, log, real)
                     else:
@@ -315,18 +326,26 @@ def _expected_window_total(src_conn , m , column , windows) -> int:
     return ex.count_source_rows(src_conn, m, " OR ".join(parts), tuple(params))
 
 
-def _plan_windows(m , options , src_conn):
-    """(windows, days, start, end, column) for a windowed table, exactly as the run will use them."""
-    batching = m.raw["batching"]
-    column = batching["column"]
-    days = options.days or batching.get("days", 15)
+def _plan_windows(m , options , src_conn , tgt_conn):
+    """(windows, how, start, end, column) for a windowed table, exactly as the run will use them.
+    Fixed windows of N days when --days is given or the mapping says mode: days; otherwise logical months."""
+    cfg = m.raw["batching"]
+    column = cfg["column"]
     low, high = ex.source_time_range(src_conn, m, column)
     start = options.start or low
     end = options.end or high
-    windows = ex.generate_windows(start, end, days, include_null_window=bool(batching.get("null_window", True)))
+    null_window = bool(cfg.get("null_window", True))
+    if options.days or cfg.get("mode", "days") != "logical_month":
+        days = options.days or cfg.get("days", 15)
+        windows = ex.generate_windows(start, end, days, include_null_window=null_window)
+        how = f"{days} days"
+    else:
+        windows = batching.logical_month_windows(tgt_conn, low, high, options.start, options.end,
+                                                 months=int(cfg.get("months", 1)), include_null_window=null_window)
+        how = "logical months"
     if options.max_windows:
         windows = windows[:options.max_windows]
-    return windows, days, start, end, column
+    return windows, how, start, end, column
 
 
 def _trusted_done_windows(m , tracker , tgt_conn , log=None) -> set:
@@ -340,6 +359,30 @@ def _trusted_done_windows(m , tracker , tgt_conn , log=None) -> set:
     return done - stale
 
 
+def _windows_total(src_conn , m , column , windows , done : set) -> int:
+    """Source rows the not-yet-done windows will read."""
+    if done:
+        return sum(ex.count_source_rows(src_conn, m, *ex.window_condition(column, s, e))
+                   for s, e in windows if (s, e) not in done)
+    return _expected_window_total(src_conn, m, column, windows)
+
+
+def _estimate_window_total(src_conn , m , options) -> int:
+    """A total that needs no windows: all rows of the table, or the rows inside the chosen range (the exact
+    windows cannot be planned yet when they depend on a table this run has not loaded, for example shift_details).
+    The exact total replaces it when the table starts."""
+    column = ex.quote_ident(m.raw["batching"]["column"])
+    parts, params = [], []
+    if options.start:
+        parts.append(f"{column} >= ?")
+        params.append(datetime(options.start.year, options.start.month, options.start.day))
+    if options.end:
+        parts.append(f"{column} < ?")
+        params.append(datetime(options.end.year, options.end.month, options.end.day) + timedelta(days=2))
+    where = " AND ".join(parts) or None
+    return ex.count_source_rows(src_conn, m, where, tuple(params))
+
+
 def _plan_totals(ms , order , options , src_conn , tgt_conn , tracker , real) -> dict[str, int | None]:
     """How many source rows each table will read, for the progress page. A table that cannot be counted
     gets None (the page then shows its rows without a percentage). Never raises."""
@@ -348,13 +391,12 @@ def _plan_totals(ms , order , options , src_conn , tgt_conn , tracker , real) ->
         m = ms.tables[name]
         try:
             if "batching" in m.raw:
-                windows, _, _, _, column = _plan_windows(m, options, src_conn)
-                done = _trusted_done_windows(m, tracker, tgt_conn) if (real and options.resume) else set()
-                if done:
-                    totals[name] = sum(ex.count_source_rows(src_conn, m, *ex.window_condition(column, s, e))
-                                       for s, e in windows if (s, e) not in done)
-                else:
-                    totals[name] = _expected_window_total(src_conn, m, column, windows)
+                try:
+                    windows, _, _, _, column = _plan_windows(m, options, src_conn, tgt_conn)
+                    done = _trusted_done_windows(m, tracker, tgt_conn) if (real and options.resume) else set()
+                    totals[name] = _windows_total(src_conn, m, column, windows, done)
+                except Exception:                  # noqa: BLE001 - windows not plannable yet: estimate instead
+                    totals[name] = _estimate_window_total(src_conn, m, options)
             else:
                 totals[name] = ex.count_source_rows(src_conn, m)
         except Exception:                          # noqa: BLE001 - a count is a nicety, not a requirement
@@ -364,14 +406,18 @@ def _plan_totals(ms , order , options , src_conn , tgt_conn , tracker , real) ->
 
 def _run_window_table(m , ctx , outcome , options , src_conn , tgt_conn , tracker , run_id , log , real):
     progress = options.progress if options.progress is not None else NULL_PROGRESS
-    windows, days, start, end, column = _plan_windows(m, options, src_conn)
-    batching = m.raw["batching"]
+    windows, how, start, end, column = _plan_windows(m, options, src_conn, tgt_conn)
     outcome.windows_total = len(windows)
     progress.table_windows(m.name, len(windows))
     tracker.plan_windows(run_id, m.name, windows)
-    log.info("windows planned: %d of %d days from %s to %s", len(windows), days, start, end)
+    log.info("windows planned: %d of %s from %s to %s", len(windows), how, start, end)
 
     done = _trusted_done_windows(m, tracker, tgt_conn, log) if (real and options.resume) else set()
+    if options.progress is not None:               # the exact total, now that the windows are known
+        try:
+            progress.set_totals({m.name: _windows_total(src_conn, m, column, windows, done)})
+        except Exception:                          # noqa: BLE001 - the estimate stays
+            pass
     if real and not done:
         ld.assert_target_empty(tgt_conn, ld.target_schema_name(m), m.tgt_table)
 
@@ -379,9 +425,10 @@ def _run_window_table(m , ctx , outcome , options , src_conn , tgt_conn , tracke
     if lookback is not None:
         log.info("is_icd lookback: %d seconds", lookback)
 
-    icd_cycles = ex.extract_all_icd_cycles(src_conn, m) if lookback is not None else None      # once, not per window
-    if icd_cycles is not None:
-        log.info("is_icd: %d cycles can contain an in-cycle downtime", icd_cycles.height)
+    machines = None
+    if lookback is not None:
+        machines = ex.list_machines(src_conn, m)                                # the cycles are read per batch
+        log.info("is_icd: candidate cycles are read per batch for %d machine(s)", len(machines))
 
     expected_total = 0
     for number, (w_start, w_end) in enumerate(windows, start=1):
@@ -402,7 +449,11 @@ def _run_window_table(m , ctx , outcome , options , src_conn , tgt_conn , tracke
             exception_frames : list[pl.DataFrame] = []
             try:
                 # is_icd is computed here in the DataFrame: the same rule as in SQL, but the SQL version takes
-                # minutes per window on a large table. The few cycles that can contain an ICD are read once per run.
+                # minutes per window on a large table. A cycle that started in an EARLIER batch and runs into this
+                # one is fetched as context (never loaded again) so the down rows of this batch can be flagged.
+                icd_cycles = None
+                if lookback is not None:
+                    icd_cycles = ex.extract_batch_icd_cycles(src_conn, m, machines, w_start, w_end, lookback)
                 batches = ex.extract_batches(src_conn, m, where, params, batch_size=options.batch_size,
                                              icd_lookback_seconds=lookback, icd_cycles=icd_cycles)
                 base_read, base_exc = outcome.rows_read, outcome.rows_excepted
@@ -456,6 +507,10 @@ def _run_window_table(m , ctx , outcome , options , src_conn , tgt_conn , tracke
         expected = _expected_window_total(src_conn, m, column, windows)
         if expected != expected_total:
             raise ValueError(f"the windows counted {expected_total} rows but the planned range holds {expected}.")
+        if options.start is None and options.end is None:      # the whole table: no row may fall between the batches
+            whole = ex.count_source_rows(src_conn, m)
+            if whole != expected_total:
+                raise ValueError(f"the batches hold {expected_total} rows but the source table has {whole}.")
 
     tracker.finish_table(run_id, m.name, outcome.rows_read, outcome.rows_loaded, outcome.rows_excepted,
                          ctx_misses(m, ctx), None)

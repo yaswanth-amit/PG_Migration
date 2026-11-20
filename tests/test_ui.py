@@ -154,7 +154,7 @@ def test_autodata_shows_the_window_options():
     at = app()
     assert not [n for n in at.number_input if n.key == "days"]
     at.checkbox(key="sel_autodata").check().run()
-    assert any(n.key == "days" and n.value == 15 for n in at.number_input)
+    assert any(n.key == "days" and n.value == 0 for n in at.number_input)            # 0 = logical months
     assert any(n.key == "max_windows" and n.value == 2 for n in at.number_input)      # rehearsal default
 
 

@@ -52,7 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="a real run needs the exact name of the target database")
     run.add_argument("--from", dest="start", type=parse_day, default=None, help="autodata: first day to include")
     run.add_argument("--to", dest="end", type=parse_day, default=None, help="autodata: last day to include")
-    run.add_argument("--days", type=int, default=None, help="autodata: days per window (mapping default: 15)")
+    run.add_argument("--days", type=int, default=None,
+                     help="autodata: fixed windows of N days; without it the batches are logical months (the mapping default)")
     run.add_argument("--max-windows", type=int, default=None,
                      help="autodata: only the first N windows (0 = all; rehearsal default 2)")
     run.add_argument("--no-resume", action="store_true", help="real run: do not skip windows completed earlier")

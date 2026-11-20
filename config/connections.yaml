@@ -1,8 +1,8 @@
 # config/connections.yaml
 source:
   driver: "ODBC Driver 17 for SQL Server"
-  server: localhost
-  database: TPM_PGSQL
+  server: AMIT-LT71\SQLEXPRESS22 
+  database: Marvelous
   user_env: SRC_DB_USER        # name of the env var, not the value
   password_env: SRC_DB_PASSWORD
 target:

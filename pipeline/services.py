@@ -63,6 +63,55 @@ def fetch_source_range(m) -> tuple[date | None, date | None]:
         return None, None
 
 
+SOURCE_COLUMNS_SQL = """
+SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE
+FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION
+"""
+
+
+def fetch_source_columns(m) -> tuple[list[dict], str | None]:
+    """Columns of the SOURCE table (read-only): name, type (with size), nullable."""
+    if is_offline():
+        return [], "offline mode: the database is not used"
+    try:
+        from pipeline.connections import source_connection
+        schema = (m.raw.get("source") or {}).get("schema", "dbo")
+        with source_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(SOURCE_COLUMNS_SQL, (schema, m.src_table))
+            rows = cur.fetchall()
+        out = []
+        for name, dtype, length, prec, scale, nullable in rows:
+            if length and length > 0:
+                shown = f"{dtype}({length})"
+            elif length == -1:
+                shown = f"{dtype}(max)"
+            elif dtype in ("decimal", "numeric") and prec:
+                shown = f"{dtype}({prec},{scale})"
+            else:
+                shown = dtype
+            out.append({"name": name, "type": dtype, "type_text": shown, "nullable": nullable == "YES"})
+        return out, None
+    except Exception as e:                      # noqa: BLE001 - the page must keep working without the source
+        return [], f"Cannot read the source database ({type(e).__name__})."
+
+
+def fetch_target_columns(m) -> tuple[dict, str | None]:
+    """Columns of the TARGET table (read-only) as TargetColumn objects."""
+    if is_offline():
+        return {}, "offline mode: the database is not used"
+    try:
+        from pipeline.connections import target_connection
+        from pipeline.target_schema import read_target_schema
+        schema = (m.raw.get("target") or {}).get("schema", "public")
+        with target_connection() as conn:
+            cols = read_target_schema(conn, schema, m.tgt_table)
+            conn.rollback()
+        return cols, None
+    except Exception as e:                      # noqa: BLE001
+        return {}, f"Cannot read the target database ({type(e).__name__})."
+
+
 def range_has_data(start : date , end : date , low : date | None , high : date | None) -> bool:
     """False only when the chosen days are known to lie entirely outside the days that hold data."""
     if low is None or high is None:

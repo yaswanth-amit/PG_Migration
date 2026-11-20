@@ -101,30 +101,18 @@ def test_where_is_added_before_order_by():
     assert sql.index("WHERE [x] = ?") < sql.index("ORDER BY")
 
 
-def test_is_icd_needs_the_lookback():
+def test_is_icd_is_not_selected_it_is_computed_in_the_dataframe():
+    sql = extract.build_select_sql(T["autodata"])
+    assert "is_icd" not in sql and "EXISTS" not in sql
+
+
+def test_a_table_with_is_icd_needs_the_candidate_cycles():
     try:
-        extract.build_select_sql(T["autodata"])
+        next(extract.extract_batches(None, T["autodata"]))
     except ValueError as e:
-        assert "icd_lookback_seconds" in str(e)
+        assert "icd_cycles" in str(e)
     else:
-        raise AssertionError("is_icd without a lookback must be refused")
-
-
-def test_is_icd_sql_has_the_rule_the_lookback_and_the_overflow_safe_datediff():
-    sql = extract.build_select_sql(T["autodata"], icd_lookback_seconds=23092)
-    assert "AS [is_icd]" in sql
-    assert "c.[datatype] = 1" in sql and "[datatype] = 2" in sql
-    assert "a.[sttime] > c.[sttime] AND a.[ndtime] < c.[ndtime]" in sql
-    assert "DATEDIFF_BIG(second, c.[sttime], c.[ndtime]) > c.[cycletime]" in sql
-    assert f"DATEADD(second, -{23092 + extract.ICD_LOOKBACK_MARGIN_SECONDS}," in sql
-
-
-def test_the_lookback_is_always_an_integer_in_the_sql():
-    try:
-        extract.build_select_sql(T["autodata"], icd_lookback_seconds="5; DROP TABLE x")
-    except ValueError:
-        return                                     # int() refuses text: nothing can be injected through it
-    raise AssertionError("a non-numeric lookback must be refused")
+        raise AssertionError("is_icd without candidate cycles must be refused")
 
 
 def test_masters_have_no_derived_columns():

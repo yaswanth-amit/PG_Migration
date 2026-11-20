@@ -1,87 +1,161 @@
 # TPM migration: SQL Server → PostgreSQL
 
-Copies the 25 `master_data` tables and `production_core.autodata` from `TPM_PGSQL` (SQL Server) to
-PostgreSQL, using one YAML mapping per table. Level 1: a copy with column mapping, no business changes.
+Copies the 25 `master_data` tables and `production_core.autodata` from SQL Server (`TPM_PGSQL`) to PostgreSQL.
+One YAML file per table (`config/mappings/`) says where each target column comes from.
+It is a plain copy with column mapping and lookups. No business changes.
 
-**Anything that changes a production system needs testing and your normal change-control review first.**
-Always run a rehearsal before a real migration.
+> Anything that changes a production system needs testing and your normal change-control review first.
+> Always run a rehearsal (the default) before a real migration.
 
-## What is where
+*Diagrams are Mermaid. They show on GitHub and in the VS Code markdown preview.*
 
-| Path | What it is |
-|---|---|
-| `config/mappings/master_data/*.yaml` | one mapping per master table; `_conventions.yaml` holds the shared rules |
-| `config/mappings/production_core/autodata.yaml` | the autodata mapping (15-day windows, `is_icd`) |
-| `config/connections.yaml` | hosts and database names only. **No passwords.** |
-| `sql/migration_schema.sql` | tracking schema (`migration.*`). **A DBA must review and run it.** |
-| `main.py` · `ui_app.py` | the two entry points: command line · web page (both stay at the top level) |
-| `pipeline/` | all the code: `mapping_config` `extract` `transform` `load` `lookups` `target_schema` (the pipeline), `runner` (orchestration), `planner` `tracking` `log_setup` `services` `connections` |
-| `tests/` | the offline tests, one file per module, plus `conftest.py` |
-| `logs/` · `reports/` | one log file per run · exception CSVs (reason, column, natural key only); created at the top level |
+---
 
-## One-time setup
-1. `pip install polars pyodbc "psycopg[binary]" pyyaml streamlit pandas`
-2. Passwords live in environment variables named in `config/connections.yaml` (`user_env`, `password_env`),
-   or in a `.env` file **outside OneDrive** whose path is in `PG_MIGRATION_ENV`. Never commit or sync a `.env`.
-3. Use a **dedicated migration login**, not `postgres`/`sa`: read-only on the source; on the target it needs
-   INSERT/DELETE on the migrated tables and the `migration` schema.
-4. Have the DBA review `sql/migration_schema.sql`, then run it on the **test** database first.
+## 1. The pipeline in one picture
 
-## Daily use
+```mermaid
+flowchart LR
+    A[("SQL Server")] -->|"1 EXTRACT<br/>read rows in batches"| B["DataFrame<br/>source columns"]
+    B -->|"2 TRANSFORM<br/>map, look up, check"| C["DataFrame<br/>target columns"]
+    C -->|"3 LOAD<br/>COPY in a transaction"| D[("PostgreSQL")]
+    B -. "bad rows" .-> E["exceptions file<br/>with a reason"]
+    C -. "counts" .-> F["migration.* tables<br/>logs, progress"]
+```
+
+Every table goes through the same three steps. Tables run in dependency order (parents before children).
+A **rehearsal** does everything inside one transaction and rolls it back. A **real** run keeps the data.
+
+---
+
+## 2. Extract
+
+SQL Server rows are read in chunks of 50,000 into a DataFrame. Only the columns the mapping uses are read.
+
+Small tables are read in one go. The big table, `autodata`, is read in **batches of one logical month**.
+A *logical day* starts when the first shift starts (for example 06:00), taken from `utility.get_logical_day`.
+
+```
+ batch 1: 2026-10-01 06:00  ->  2026-11-01 06:00
+ batch 2: 2026-11-01 06:00  ->  2026-12-01 06:00      each batch starts where the last one ended
+```
+
+* A row belongs to the batch that contains its start time (`sttime`). No gaps, no overlaps.
+* The run stops if the batches miss any row (their total must equal the table's row count).
+
+---
+
+## 3. Transform
+
+Each DataFrame goes through the rules of its YAML file: `copy`, `cast`, `trim`, `coalesce`, `map`, `lookup`, and so on.
+
+* **Lookup:** a business id from the source (for example a machine code) is replaced by the target's `iot_id`,
+  using the parent table already loaded in PostgreSQL.
+* **Checks:** the value fits the target type, NOT NULL columns have a value, no duplicate key, the parent was found.
+* A row that fails a check is **not dropped silently**. It goes to `reports/<table>_exceptions.csv` with a reason.
+* After every table: `rows read = rows loaded + rows in the exceptions file`, or the run stops.
+
+### How `is_icd` is solved for autodata
+
+`autodata` has two kinds of rows: **cycles** (`datatype = 1`, a part being machined) and **downtimes** (`datatype = 2`).
+A downtime is an **ICD** (in-cycle downtime) when it happens *inside* a cycle that ran longer than its own `cycletime`.
+
+> **Rule:** downtime is ICD when a cycle of the **same machine**, with `duration > cycletime`,
+> **starts before** the downtime starts and **ends after** the downtime ends.
+
+SQL Server did this with a slow check per row. Here it is done in Polars. Each batch is split into **three frames**:
+
+```mermaid
+flowchart TD
+    A["One batch"] --> F1["FRAME 1: cycles that could contain a downtime<br/>cycle longer than its cycletime<br/>read from SQL Server, per machine"]
+    A --> F2["FRAME 2: the batch's downtime rows<br/>datatype = 2"]
+    A --> F3["FRAME 3: all other rows<br/>normal cycles"]
+    F2 --> M{"inside a cycle<br/>of Frame 1?"}
+    F1 --> M
+    M -->|yes| T["is_icd = true"]
+    M -->|no| N["is_icd = false"]
+    F3 --> N2["is_icd = false"]
+    T --> OUT["batch with is_icd,<br/>goes on to the load"]
+    N --> OUT
+    N2 --> OUT
+```
+
+**Worked example.** Batch 2 starts at 06:00. One cycle began before 06:00 and is still running, so it belongs to batch 1
+but is needed here. Machine M1:
+
+```
+ 06:00 boundary
+   |
+ 00:00 ================== 07:00     cycle C1  (cycletime 1 h, ran 7 h)   <- belongs to batch 1
+   |     06:45-06:50                downtime D1
+   |        06:55-06:58             downtime D2
+   |                07:01-07:04     normal cycle N1
+   |                         09:00-09:20  downtime D3
+   |                                10:00 ======== 10:30   cycle C2 (cycletime 10 min, ran 30 min)
+   |                                           10:10-10:15  downtime D4
+```
+
+| Frame | Rows | Notes |
+|---|---|---|
+| **1: cycles that could contain a downtime** | C1, C2 | C1 is *borrowed* from batch 1. It is used only to check, and is **never loaded again**. C2 belongs to batch 2. |
+| **2: downtime rows of batch 2** | D1, D2, D3, D4 | These are the rows that get tested. |
+| **3: all other rows of batch 2** | N1 | Nothing to test. |
+
+| Downtime | Inside a Frame 1 cycle? | `is_icd` |
+|---|---|---|
+| D1 06:45-06:50 | yes, C1 (00:00-07:00) | **true** |
+| D2 06:55-06:58 | yes, C1 | **true** |
+| D3 09:00-09:20 | no | false |
+| D4 10:10-10:15 | yes, C2 (10:00-10:30) | **true** |
+| N1 (a cycle) | not tested | false |
+
+Why a *borrowed* cycle is needed: without C1, D1 and D2 would look like ordinary downtimes. A cycle can start in one
+batch and its downtimes fall in the next one.
+
+The result equals the original SQL rule. Checked on real data with batches of 7 minutes, 1 hour and 6 hours:
+same flags, none missing, none extra.
+
+---
+
+## 4. Load
+
+```mermaid
+flowchart LR
+    subgraph P["Normal table: one transaction"]
+        direction TB
+        P1["target must be empty"] --> P2["COPY all batches"] --> P3["record the result"] --> P4(["COMMIT"])
+    end
+    subgraph W["autodata: one transaction per batch"]
+        direction TB
+        W1["delete this batch's rows"] --> W2["COPY the batch"] --> W3["record the batch"] --> W4(["COMMIT"])
+    end
+```
+
+* A table or batch is stored **completely or not at all**. Its result is recorded in the same commit, so the history can
+  never say "done" for rows that were rolled back.
+* Deleting a batch first makes it **safe to repeat**. Resume skips batches finished earlier, but only if their rows are still in the target.
+* If a table fails, the tables that depend on it are skipped. The others continue.
+* Counts, times and errors go to `migration.*`, logs and `logs/progress_*.json` (the page reads this live). Never row values.
+
+---
+
+## 5. Run it
+
 ```
 python main.py list                                    # tables, sources, targets, dependencies
-python main.py plan --tables component_operation_pricing   # shows the dependency error, no database used
+python main.py plan --tables autodata                  # dependency check, no database used
 python main.py run  --tables all                       # REHEARSAL (default): runs everything, rolls it back
 python main.py run  --tables all --mode real --confirm-target <target database name>
-python main.py run  --tables autodata --from 2026-01-01 --to 2026-03-31 --days 15 --max-windows 0
 streamlit run ui_app.py                                # the same, with a page
 ```
-* A table can only run when the tables it depends on are selected too, or already migrated.
-* A rehearsal runs the whole chain in **one transaction** and rolls it back, so child tables see the parents
-  loaded just before them. It proves the database accepts every row. (Sequences used for generated ids still
-  advance: harmless gaps.) For autodata a rehearsal uses the first 2 windows unless `--max-windows 0`.
-* A real run commits table by table, and window by window for autodata. A failed table blocks the tables that
-  depend on it; independent tables continue. An interrupted autodata run **resumes**: finished windows are skipped, but only when their rows are still in the
-  target. If the target was emptied since, those windows are loaded again.
-* Exit codes: 0 finished · 1 a table failed · 2 bad request · 3 tracking schema missing.
+Useful options: `--from/--to` (logical days) · `--days N` (fixed windows instead of months) · `--no-resume` ·
+`--max-windows 0` (all batches).
 
-## Reading the result
-* `completed_with_exceptions`: some rows could not be stored (NOT NULL, duplicate key, value too big). They are
-  listed in `reports/<table>_exceptions.csv`; nothing is silently dropped.
-* **Lookup misses** (for example `component_information.customer_iot_id = 6`) mean a business id has no match in
-  its parent table. The row is still loaded with NULL in the link column. This is a data question for the owner.
-* The `migration.*` tables hold counts, times and error classes, never row values. Logs never contain row values
-  and mask passwords.
+**Setup:** `pip install polars pyodbc "psycopg[binary]" pyyaml streamlit pandas`. Passwords come from environment variables
+named in `config/connections.yaml`, or a `.env` outside OneDrive (it is in `.gitignore`). Use a dedicated migration login.
+A DBA reviews `sql/migration_schema.sql` first. Tests: `python -m pytest -q`.
 
-## Rules the tool relies on (decided with the owner)
-* Target `master_data` tables and `production_core.autodata` are **empty** when a real run starts; nothing else
-  writes to `production_core.autodata` during the run (a window is redone by deleting its `st_time` range first).
-* Source rows are not modified once the migration starts.
-* NULL in the source becomes the column's database default if it has one, otherwise stays NULL; `updated_by` NULL
-  becomes `pct`; surrogate `id` columns come from sequences; `autodata_ICD` is not migrated (`is_icd` is computed).
-* `is_icd` is evaluated against the whole source table with a bounded lookback, so a cycle in an earlier window is
-  found. Verified equal to the original rule for window sizes of 1, 3, 15 and 4000 days.
+**Rules:** the target tables must be empty before a real run, and source rows must not change during it.
+`autodata_ICD` is not migrated; `is_icd` is derived as in section 3.
 
-## Volume test data (source side)
-`python -m testdata.synthetic_autodata --rows 10000000` generates 1 crore autodata rows in the SQL Server source that follow the
-patterns of the real rows: production cycles, McTI cycles, ICD (also in `autodata_icd`), background downtimes and NO_DATA gaps.
-It is a **dry run** unless `--execute` is given; `--cleanup --execute` removes exactly the rows it inserted (tag `SYNTH_1CR` in
-`SplString2` / `Remarks`, neither is migrated). New rows are placed before the first real row, so real data and
-`autodata_maxtime` are untouched. Use it only on a test database.
-
-## Tests (no database needed)
-Run everything from the project folder: `python -m pytest -q`  ·  or one file: `python tests/test_transform.py`
-(`test_transform` `test_load` `test_tracking` `test_planner` `test_extract` `test_runner` `test_main` `test_ui`).
-
-Module self-checks that read the real databases (read-only) are run as modules, not as scripts:
-`python -m pipeline.extract` (row counts of all masters) · `python -m pipeline.lookups` (lookup preflight) ·
-`python -m pipeline.transform` (transform every master) · `python -m pipeline.target_schema` · `python -m pipeline.mapping_config`.
-
-Code inside `pipeline/` imports its neighbours as `from pipeline.<module> import ...`, so it always has to be
-started from the project folder (where `main.py` is), never from inside `pipeline/`.
-
-## Known limits
-* `load.py` uses row-by-row `COPY` (`write_row`). Correct, and fine for the masters; measure it on a full-size
-  autodata window before committing to a schedule, and switch to a faster bulk path if needed.
-* The first real run needs the `migration` schema and a write-capable login; neither was available for testing
-  tracking against a live database. Everything else was rehearsed against the local `tpm_migration` target.
+**Open items:** `sql/autodata_unique_key.sql` (unique `machine_iot_id, st_time`) is for DBA review and is never run by the tool.
+Production-size timing of the per-batch cycle query is not measured yet.

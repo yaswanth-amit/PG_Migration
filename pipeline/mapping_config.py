@@ -192,7 +192,9 @@ def build_load_order(tables : dict[str,TableMapping]) -> list[str]:
     return load_order
 
 
-def load_mappings(folder : Path = MAPPING_DIR) -> MappingSet:
+def load_mappings(folder : Path = MAPPING_DIR , overrides_dir : Path | None = None) -> MappingSet:
+    """overrides_dir: where the user's gap-filling choices are (default: config/overrides when folder is the
+    standard mapping folder, otherwise none). Choices never change a reviewed mapping, they only add to it."""
     tables : dict[str,TableMapping] = {}
     all_errors : list[str] = []
 
@@ -222,6 +224,13 @@ def load_mappings(folder : Path = MAPPING_DIR) -> MappingSet:
     known_tables = set(tables.keys())
     for tbl in tables.values():
         all_errors.extend(validate_mapping(tbl, known_tables))
+
+    if not all_errors:
+        from pipeline import mapping_overrides
+        if overrides_dir is None and folder == MAPPING_DIR:
+            overrides_dir = mapping_overrides.OVERRIDE_DIR
+        if overrides_dir is not None:
+            all_errors.extend(mapping_overrides.apply_overrides(tables, overrides_dir))
 
     if all_errors:
         raise ValueError("Validation failed:\n" + "\n".join(all_errors))

@@ -1,6 +1,6 @@
 import polars as pl
 from datetime import datetime, timedelta
-from typing import Callable, Iterator, Sequence
+from typing import Iterator, Sequence
 from pipeline.mapping_config import TableMapping
 
 # DATEDIFF counts second boundaries crossed, so a cycle can be up to one second longer than the
@@ -71,55 +71,16 @@ def _source_table_sql(m : TableMapping) -> str:
     return f"{quote_ident(schema)}.{quote_ident(table)}"
 
 
-def is_icd_sql(m : TableMapping , lookback_seconds : int) -> str:
-    """SQL for the autodata rule 'is_icd' (see derived_rules.is_icd in autodata.yaml).
-
-    A down row (datatype 2) is an ICD when a cycle row (datatype 1) of the same machine ran longer than its
-    cycletime and contains the down row. The cycle can start in an EARLIER 15-day window, so the rule is
-    evaluated against the whole table, not just the rows of the current window. The lookback
-    (c.sttime >= ...) only lets SQL Server seek on the (mc, sttime) index: a containing cycle cannot start
-    earlier than the longest qualifying cycle (+ margin) before the down row, so the answer never changes.
-    DATEDIFF_BIG is used instead of DATEDIFF so a bad timestamp (for example year 9999) cannot overflow.
-    """
-    seconds = int(lookback_seconds) + ICD_LOOKBACK_MARGIN_SECONDS
-    return (
-        "CASE WHEN [datatype] = 2 AND EXISTS ("
-        f" SELECT 1 FROM {_source_table_sql(m)} AS c"
-        " WHERE c.[mc] = a.[mc] AND c.[datatype] = 1"
-        "   AND c.[sttime] < a.[sttime]"
-        f"   AND c.[sttime] >= DATEADD(second, -{seconds}, CASE WHEN a.[ndtime] < a.[sttime] THEN a.[ndtime] ELSE a.[sttime] END)"
-        "   AND DATEDIFF_BIG(second, c.[sttime], c.[ndtime]) > c.[cycletime]"
-        "   AND a.[sttime] > c.[sttime] AND a.[ndtime] < c.[ndtime])"
-        " THEN 1 ELSE 0 END"
-    )
-
-
-# derived rule name -> function(mapping, lookback_seconds) that returns the SQL expression
-DERIVED_SQL : dict[str, Callable] = {"is_icd": is_icd_sql}
-
-
 def derived_columns(m : TableMapping) -> list[str]:
     return [c.params["name"] for c in m.columns if c.rule == "derived"]
 
 
-def build_select_sql(m : TableMapping , where : str | None = None , ordered : bool = True ,
-                     icd_lookback_seconds : int | None = None , icd_in_frame : bool = False) -> str:
-    """SELECT of only the source columns the mapping needs.
-    where                - optional SQL condition using ? placeholders (the 15-day windows)
-    ordered              - ORDER BY the natural key, so every run reads the rows in the same order
-    icd_lookback_seconds - needed when the mapping has the derived rule is_icd (see compute_icd_lookback)
-    icd_in_frame         - leave is_icd out of the SQL: it is added to every batch by add_is_icd (much faster)"""
+def build_select_sql(m : TableMapping , where : str | None = None , ordered : bool = True) -> str:
+    """SELECT of only the source columns the mapping needs. Derived columns (is_icd) are NOT selected:
+    they are added to every batch in Polars (see add_is_icd).
+    where   - optional SQL condition using ? placeholders (the batch windows)
+    ordered - ORDER BY the natural key, so every run reads the rows in the same order"""
     columns = [quote_ident(c) for c in collect_source_columns(m)]
-
-    for name in derived_columns(m):
-        if icd_in_frame and name == "is_icd":
-            continue
-        if name not in DERIVED_SQL:
-            raise ValueError(f"Table '{m.name}': no SQL is defined for the derived rule '{name}'.")
-        if name == "is_icd" and icd_lookback_seconds is None:
-            raise ValueError(f"Table '{m.name}': the derived rule 'is_icd' needs icd_lookback_seconds.")
-        columns.append(f"{DERIVED_SQL[name](m, icd_lookback_seconds)} AS {quote_ident(name)}")
-
     cols_sql = ", ".join(columns) if columns else "*"
     sql = f"SELECT {cols_sql} FROM {_source_table_sql(m)} AS a"
 
@@ -137,10 +98,12 @@ def build_select_sql(m : TableMapping , where : str | None = None , ordered : bo
 def extract_batches(conn , m : TableMapping , where : str | None = None , params : Sequence = () ,
                     batch_size : int = 50_000 , icd_lookback_seconds : int | None = None ,
                     icd_cycles : pl.DataFrame | None = None) -> Iterator[pl.DataFrame]:
-    """icd_cycles given: is_icd is computed here in the DataFrame (see extract_all_icd_cycles / add_is_icd)
-    instead of by a correlated subquery in SQL Server, which is orders of magnitude slower."""
+    """Read rows in chunks. A table with the derived column is_icd needs icd_cycles (the candidate cycles):
+    is_icd is computed here in the DataFrame by add_is_icd."""
     in_frame = icd_cycles is not None
-    sql = build_select_sql(m, where=where, icd_lookback_seconds=icd_lookback_seconds, icd_in_frame=in_frame)
+    if not in_frame and "is_icd" in derived_columns(m):
+        raise ValueError(f"Table '{m.name}': the derived rule 'is_icd' needs icd_cycles.")
+    sql = build_select_sql(m, where=where)
     cursor = conn.cursor()
     try:
         cursor.execute(sql, *params)
@@ -238,24 +201,46 @@ def window_condition(column : str , start : datetime | None , end : datetime | N
     return f"{col} >= ? AND {col} < ?", (start, end)
 
 
-def extract_all_icd_cycles(conn , m : TableMapping) -> pl.DataFrame:
-    """Every cycle (datatype 1) that ran longer than its cycletime: the only cycles that can contain an ICD.
-    There are few of them, so they are read ONCE per run and reused for every window; a query per window would
-    scan the whole table each time (about 5 s on 1 crore rows)."""
-    sql = (f"SELECT [mc], [sttime], [ndtime] FROM {_source_table_sql(m)} WHERE [datatype] = 1"
-           " AND DATEDIFF_BIG(second, [sttime], [ndtime]) > [cycletime]")
+def list_machines(conn , m : TableMapping) -> list[str]:
+    """The machines (column mc) that have rows, read once per run so the per-batch cycle query can seek per machine."""
     cursor = conn.cursor()
     try:
-        cursor.execute(sql)
-        rows = [tuple(r) for r in cursor.fetchall()]
+        cursor.execute(f"SELECT DISTINCT [mc] FROM {_source_table_sql(m)} WHERE [mc] IS NOT NULL")
+        return sorted(str(r[0]) for r in cursor.fetchall())
     finally:
         cursor.close()
+
+
+def extract_batch_icd_cycles(conn , m : TableMapping , machines : Sequence[str] , start : datetime | None ,
+                             end : datetime | None , lookback_seconds : int) -> pl.DataFrame:
+    """The cycles (datatype 1, longer than their cycletime) that can contain a down row OWNED by the batch
+    [start, end): the cycles that start in the batch, plus the cycles that started EARLIER and run into it
+    (for example 00:00 to 07:00 when the batch starts at 06:00). The earlier ones are context only: they are used to
+    flag the down rows and are never loaded again, because the batch that owns them (by sttime) loads them.
+
+    No cycle that contains a down row can start before start - lookback (the lookback is the longest qualifying
+    cycle), so the range [start - lookback - margin, end) is exact. One index seek per machine on (mc, sttime).
+    (A row whose end time is before its start time cannot be loaded anyway, so it is not a concern here.)"""
     schema = {"mc": pl.String, "sttime": pl.Datetime, "ndtime": pl.Datetime}
+    if start is None or end is None:                     # the 'time is NULL' batch: a NULL time is never inside a cycle
+        return pl.DataFrame(schema=schema)
+    seconds = int(lookback_seconds) + ICD_LOOKBACK_MARGIN_SECONDS
+    sql = (f"SELECT [mc], [sttime], [ndtime] FROM {_source_table_sql(m)} WHERE [mc] = ? AND [datatype] = 1"
+           f" AND [sttime] >= DATEADD(second, -{seconds}, ?) AND [sttime] < ?"
+           " AND DATEDIFF_BIG(second, [sttime], [ndtime]) > [cycletime]")
+    rows : list[tuple] = []
+    cursor = conn.cursor()
+    try:
+        for machine in machines:
+            cursor.execute(sql, machine, start, end)
+            rows += [tuple(r) for r in cursor.fetchall()]
+    finally:
+        cursor.close()
     return pl.DataFrame(rows, schema=list(schema), orient="row", infer_schema_length=None) if rows else pl.DataFrame(schema=schema)
 
 
 def add_is_icd(batch : pl.DataFrame , cycles : pl.DataFrame , lookback_seconds : int) -> pl.DataFrame:
-    """Add the column is_icd (1 / 0), with exactly the rule of is_icd_sql: a down row (datatype 2) is an ICD when a
+    """Add the column is_icd (1 / 0), with exactly the rule of s_GetCockpitData: a down row (datatype 2) is an ICD when a
     cycle of the same machine, longer than its cycletime, starts before it and ends after it. A NULL time is never
     inside a cycle. Cycles never overlap in practice, but the join does not assume it: any containing cycle counts."""
     seconds = int(lookback_seconds) + ICD_LOOKBACK_MARGIN_SECONDS
@@ -283,7 +268,7 @@ def add_is_icd(batch : pl.DataFrame , cycles : pl.DataFrame , lookback_seconds :
 
 def compute_icd_lookback(conn , m : TableMapping) -> int:
     """Longest cycle (in seconds) that qualifies for is_icd: a datatype 1 row that ran longer than its cycletime.
-    Measure it once per run on the real source; it bounds the lookback in is_icd_sql."""
+    Measure it once per run on the real source; it bounds how far back a containing cycle can start."""
     sql = (f"SELECT MAX(DATEDIFF_BIG(second, [sttime], [ndtime])) FROM {_source_table_sql(m)} "
            "WHERE [datatype] = 1 AND DATEDIFF_BIG(second, [sttime], [ndtime]) > [cycletime]")
     cursor = conn.cursor()
