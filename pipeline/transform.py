@@ -21,6 +21,7 @@ class TransformContext:
     lookups : Any = None                              # a LookupCache (anything with .get(LookupUse))
     references : dict[str, pl.DataFrame] = field(default_factory=dict)   # for example PredefinedDownCodeInfo
     lookup_misses : dict[str, int] = field(default_factory=dict)         # "table.column" -> rows with no match
+    unique_keys : list[list[str]] = field(default_factory=list)          # unique keys read from the target table
 
 
 @dataclass
@@ -290,7 +291,7 @@ def _group_table(df : pl.DataFrame , m : TableMapping) -> pl.DataFrame:
 
 # ----------------------------------------------------------------------------- main
 
-def duplicate_key_sets(m : TableMapping) -> list[list[str]]:
+def duplicate_key_sets(m : TableMapping , extra : list[list[str]] | None = None) -> list[list[str]]:
     """Target column sets that must be unique in the loaded rows: the primary key, the unique constraints, and
     'dedupe' keys (unique in the migrated data without a database constraint, for example autodata's
     machine_iot_id + st_time). The first row of a key is kept, later ones become 'duplicate_key' exceptions."""
@@ -300,7 +301,12 @@ def duplicate_key_sets(m : TableMapping) -> list[list[str]]:
         key_sets.append(list(target_sec["primary_key"]))
     key_sets.extend(list(k) for k in (target_sec.get("unique") or []))
     key_sets.extend(list(k) for k in (target_sec.get("dedupe") or []))
-    return key_sets
+    key_sets.extend(list(k) for k in (extra or []))          # the target table's own unique keys
+    unique : list[list[str]] = []
+    for keys in key_sets:                                    # each key set once
+        if keys and keys not in unique:
+            unique.append(keys)
+    return unique
 
 
 def _key_expr(work : pl.DataFrame , m : TableMapping) -> pl.Expr:
@@ -375,7 +381,7 @@ def transform_batch(df : pl.DataFrame , m : TableMapping , ctx : TransformContex
             masks.append((mask_col, "null_in_not_null_column", dst))
 
     # 3. duplicate primary / unique keys inside this batch (the later duplicates cannot be loaded)
-    key_sets = duplicate_key_sets(m)
+    key_sets = duplicate_key_sets(m, ctx.unique_keys)
     for keys in key_sets:
         if not keys or not all(k in out_cols for k in keys):
             continue

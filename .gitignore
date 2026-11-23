@@ -20,3 +20,6 @@ venv/
 .playwright-mcp/
 .vscode/
 *.tmp
+
+# config files
+config/connections.yaml

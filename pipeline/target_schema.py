@@ -125,6 +125,29 @@ def polars_dtype(pg_type : str) -> pl.DataType:
     raise ValueError(f"No Polars type for Postgres type '{pg_type}'")
 
 
+UNIQUE_KEYS_SQL = """
+SELECT array_agg(a.attname ORDER BY k.ord) AS columns
+FROM pg_index i
+JOIN pg_class     c ON c.oid = i.indrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+WHERE n.nspname = %s AND c.relname = %s
+  AND i.indisunique AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indisvalid
+  AND k.attnum > 0
+GROUP BY i.indexrelid
+"""
+
+
+def read_unique_keys(pg_conn , schema : str , table : str) -> list[list[str]]:
+    """Column sets that the target table keeps unique (primary key, unique constraints and unique indexes
+    without a condition or expression). A repeat of such a key cannot be loaded, so the pipeline removes it from
+    the data first instead of letting the COPY fail."""
+    with pg_conn.cursor() as cur:
+        cur.execute(UNIQUE_KEYS_SQL, (schema, table))
+        return [list(row[0]) for row in cur.fetchall()]
+
+
 def read_target_schema(pg_conn , schema : str , table : str) -> dict[str, TargetColumn]:
     with pg_conn.cursor() as cur:
         cur.execute(SCHEMA_SQL, (schema, table))

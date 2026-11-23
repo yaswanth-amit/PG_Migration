@@ -61,3 +61,42 @@ def test_autodata_is_read_in_id_order_so_the_first_row_of_a_key_is_the_lowest_id
     from pipeline.mapping_config import load_mappings
     sql = extract.build_select_sql(load_mappings().tables["autodata"], where="[sttime] >= ?")
     assert sql.endswith("ORDER BY [id]")
+
+
+def test_the_targets_own_unique_keys_are_filtered_too():
+    """employee_information: the target has UNIQUE(interface_id) that the YAML does not list."""
+    from pipeline.transform import TransformContext
+    m = table()
+    ctx = TransformContext(load_time=T1, target_schema={}, unique_keys=[["interface_id"], ["id"]])
+    assert duplicate_key_sets(m, ctx.unique_keys) == [["id"], ["interface_id"]]       # each key once
+    seen = runner.SeenKeys(m, ctx)
+    df = pl.DataFrame({"id": [1, 2, 3], "interface_id": ["a", "b", "a"]})
+    first = seen.filter(TransformResult(rows=df.head(2), exceptions=_empty_exceptions()))
+    second = seen.filter(TransformResult(rows=df.tail(1), exceptions=_empty_exceptions()))
+    assert first.rows.height == 2 and second.rows.height == 0
+    assert second.exceptions["column"].to_list() == ["interface_id"]
+
+
+def test_transform_removes_a_repeat_of_a_target_unique_key_inside_a_chunk():
+    from pipeline.mapping_config import load_mappings
+    from pipeline.target_schema import TargetColumn
+    from pipeline.transform import TransformContext, transform_batch
+    m = load_mappings().tables["employee_information"]
+    schema = {c.dst: TargetColumn(c.dst, "text", True) for c in m.columns}
+    schema["is_admin"] = TargetColumn("is_admin", "boolean", True)
+    schema["company_default"] = TargetColumn("company_default", "boolean", True)
+    schema["updated_at"] = TargetColumn("updated_at", "timestamp without time zone", True)
+    ctx = TransformContext(load_time=T1, target_schema=schema, unique_keys=[["interface_id"]])
+    n = 2
+    df = pl.DataFrame({"Employeeid": ["E1", "E2"], "interfaceid": ["20128", "20128"], "employeeno": [1, 2],
+                       "Name": ["A", "B"], "designation": [None] * n, "qualification": [None] * n, "address1": [None] * n,
+                       "address2": [None] * n, "phone": [None] * n, "Email": [None] * n, "MobileNo": [None] * n,
+                       "status": [1, 1], "isadmin": [0, 0], "upassword": [None] * n, "LandingPage": [None] * n,
+                       "Company_default": [None] * n, "Role": [None] * n, "UpdatedTS": [None] * n},
+                      schema_overrides={"Company_default": pl.Boolean, "UpdatedTS": pl.Datetime, "designation": pl.String,
+                                        "qualification": pl.String, "address1": pl.String, "address2": pl.String,
+                                        "phone": pl.String, "Email": pl.String, "MobileNo": pl.String,
+                                        "upassword": pl.String, "LandingPage": pl.String, "Role": pl.String})
+    out = transform_batch(df, m, ctx)
+    assert out.rows["employee_id"].to_list() == ["E1"]
+    assert out.exceptions["reason"].to_list() == ["duplicate_key"]

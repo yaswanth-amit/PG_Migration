@@ -22,7 +22,7 @@ from pipeline.mapping_config import MappingSet, TableMapping, table_dependencies
 from pipeline.planner import plan_run, validate_selection
 from pipeline.progress import NULL_PROGRESS
 from pipeline.schema_adapt import adapt_to_source, list_source_columns
-from pipeline.target_schema import read_target_schema
+from pipeline.target_schema import read_target_schema, read_unique_keys
 from pipeline.transform import TransformContext, TransformResult, duplicate_key_sets, transform_batch
 
 
@@ -105,8 +105,8 @@ class SeenKeys:
     removes duplicates inside a chunk; this remembers the keys of the chunks before, so a row whose key was
     already loaded in this load is an exception ('duplicate_key') instead of a second copy. The first row stays."""
 
-    def __init__(self , m : TableMapping):
-        self.key_sets = duplicate_key_sets(m)
+    def __init__(self , m : TableMapping , ctx : TransformContext | None = None):
+        self.key_sets = duplicate_key_sets(m, ctx.unique_keys if ctx is not None else None)
         self.seen : dict[tuple, pl.DataFrame] = {}
 
     def filter(self , result : TransformResult) -> TransformResult:
@@ -136,7 +136,7 @@ def _results(batches , m : TableMapping , ctx : TransformContext , counters : di
     """Transform each batch as the loader asks for it, counting what was read.
     The generator is pulled by the loader, so the stage reported here is the real one:
     extract (fetching a batch) -> transform -> load (the loader writes it while we are suspended)."""
-    seen = SeenKeys(m)
+    seen = SeenKeys(m, ctx)
     try:
         iterator = iter(batches)
         while True:
@@ -239,6 +239,11 @@ def run_migration(ms : MappingSet , options : RunOptions , src_conn , tgt_conn ,
                         load_time=load_time,
                         target_schema=read_target_schema(tgt_conn, schema_name, m.tgt_table),
                         lookups=cache, references=references)
+
+                    try:                                   # the target's own unique keys: repeats are filtered, not loaded
+                        ctx.unique_keys = read_unique_keys(tgt_conn, schema_name, m.tgt_table)
+                    except Exception:                      # noqa: BLE001 - without them only the YAML keys are checked
+                        ctx.unique_keys = []
 
                     # leave out rules whose source column this source database does not have
                     m, adaptation = adapt_to_source(m, list_source_columns(src_conn, m), ctx.target_schema)
