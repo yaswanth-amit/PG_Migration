@@ -4,7 +4,7 @@ Run with:  python -m pytest tests/test_batching.py
 """
 import random
 import sys
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))      # the project folder
 

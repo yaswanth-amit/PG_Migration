@@ -10,7 +10,7 @@ Exit codes: 0 finished, 1 a table failed, 2 bad request (selection, options, mis
 """
 import argparse
 import sys
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 
 from pipeline.mapping_config import MappingSet, load_mappings
 from pipeline.planner import plan_run, validate_selection, dependents

@@ -290,6 +290,19 @@ def _group_table(df : pl.DataFrame , m : TableMapping) -> pl.DataFrame:
 
 # ----------------------------------------------------------------------------- main
 
+def duplicate_key_sets(m : TableMapping) -> list[list[str]]:
+    """Target column sets that must be unique in the loaded rows: the primary key, the unique constraints, and
+    'dedupe' keys (unique in the migrated data without a database constraint, for example autodata's
+    machine_iot_id + st_time). The first row of a key is kept, later ones become 'duplicate_key' exceptions."""
+    target_sec = m.raw.get("target") or {}
+    key_sets : list[list[str]] = []
+    if target_sec.get("primary_key"):
+        key_sets.append(list(target_sec["primary_key"]))
+    key_sets.extend(list(k) for k in (target_sec.get("unique") or []))
+    key_sets.extend(list(k) for k in (target_sec.get("dedupe") or []))
+    return key_sets
+
+
 def _key_expr(work : pl.DataFrame , m : TableMapping) -> pl.Expr:
     """The natural key of a row as text, used to identify rows in the exceptions report."""
     natural_key = (m.raw.get("source") or {}).get("natural_key") or []
@@ -362,11 +375,7 @@ def transform_batch(df : pl.DataFrame , m : TableMapping , ctx : TransformContex
             masks.append((mask_col, "null_in_not_null_column", dst))
 
     # 3. duplicate primary / unique keys inside this batch (the later duplicates cannot be loaded)
-    target_sec = m.raw.get("target") or {}
-    key_sets = []
-    if target_sec.get("primary_key"):
-        key_sets.append(list(target_sec["primary_key"]))
-    key_sets.extend(list(k) for k in (target_sec.get("unique") or []))
+    key_sets = duplicate_key_sets(m)
     for keys in key_sets:
         if not keys or not all(k in out_cols for k in keys):
             continue

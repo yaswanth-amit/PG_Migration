@@ -9,9 +9,6 @@ from dataclasses import dataclass, field, replace
 
 from pipeline.mapping_config import ColumnRule, TableMapping
 
-# Rules that need no source column of their own
-NO_SOURCE_RULES = {"constant", "load_time", "set_null", "omit", "derived", "lookup"}
-
 
 @dataclass
 class Adaptation:
@@ -36,8 +33,6 @@ def list_source_columns(conn , m : TableMapping) -> set[str] | None:
 
 def _missing(col : ColumnRule , present : set[str]) -> list[str]:
     needed : list[str] = []
-    if col.rule not in NO_SOURCE_RULES or col.rule == "lookup":
-        pass
     if col.rule == "lookup":
         match = col.params.get("match")
         if isinstance(match, dict):
@@ -67,8 +62,6 @@ def adapt_to_source(m : TableMapping , source_columns : set[str] | None , target
         if col.rule == "coalesce" and fb and str(fb).lower() not in source_columns:
             del params["fallback_col"]
             result.notes.append(f"{col.dst}: fallback column '{fb}' is not in the source, so it is not used")
-            if "fallback" not in params and col.src and col.src.lower() in source_columns:
-                pass
             col = ColumnRule(col.dst, col.src, col.rule, params)
 
         missing = _missing(col, source_columns)

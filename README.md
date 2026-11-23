@@ -157,5 +157,6 @@ A DBA reviews `sql/migration_schema.sql` first. Tests: `python -m pytest -q`.
 **Rules:** the target tables must be empty before a real run, and source rows must not change during it.
 `autodata_ICD` is not migrated; `is_icd` is derived as in section 3.
 
-**Open items:** `sql/autodata_unique_key.sql` (unique `machine_iot_id, st_time`) is for DBA review and is never run by the tool.
-Production-size timing of the per-batch cycle query is not measured yet.
+**Duplicates:** no unique constraint is added to the target. Rows with the same key (`autodata`: `machine_iot_id` + `st_time`) are
+removed from the data before the insert. The first row stays; the others go to the exceptions report as `duplicate_key`.
+**Open items:** production-size timing of the per-batch cycle query is not measured yet.

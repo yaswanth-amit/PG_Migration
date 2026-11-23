@@ -19,6 +19,7 @@ target:
   table: autodata
   primary_key: [id]              # PRIMARY KEY (id) is the only constraint; id has a default sequence
   unique: []
+  dedupe: [[machine_iot_id, st_time]]   # no unique constraint on the table: duplicates are removed from the data before the insert (first row of a key stays, the rest are listed as duplicate_key exceptions)
 
 depends_on: [machine_information, component_information, component_operation_pricing, employee_information, down_code_information, shift_details]   # shift_details: the batches are cut at logical-day boundaries
 

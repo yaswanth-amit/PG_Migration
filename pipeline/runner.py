@@ -23,7 +23,7 @@ from pipeline.planner import plan_run, validate_selection
 from pipeline.progress import NULL_PROGRESS
 from pipeline.schema_adapt import adapt_to_source, list_source_columns
 from pipeline.target_schema import read_target_schema
-from pipeline.transform import TransformContext, transform_batch
+from pipeline.transform import TransformContext, TransformResult, duplicate_key_sets, transform_batch
 
 
 class SelectionError(ValueError):
@@ -100,11 +100,43 @@ def _reference_tables(ms : MappingSet , names : list[str]) -> set[str]:
     return found
 
 
+class SeenKeys:
+    """Duplicate check ACROSS the chunks of one load (a table, or one autodata batch). The transform already
+    removes duplicates inside a chunk; this remembers the keys of the chunks before, so a row whose key was
+    already loaded in this load is an exception ('duplicate_key') instead of a second copy. The first row stays."""
+
+    def __init__(self , m : TableMapping):
+        self.key_sets = duplicate_key_sets(m)
+        self.seen : dict[tuple, pl.DataFrame] = {}
+
+    def filter(self , result : TransformResult) -> TransformResult:
+        rows, extra = result.rows, []
+        for keys in self.key_sets:
+            if not keys or not all(k in rows.columns for k in keys) or rows.height == 0:
+                continue
+            numbered = rows.with_row_index("_r")
+            complete = numbered.filter(pl.all_horizontal([pl.col(k).is_not_null() for k in keys]))   # NULLs never collide
+            before = self.seen.get(tuple(keys))
+            if before is not None and complete.height:
+                dup = complete.join(before, on=keys, how="semi")
+                if dup.height:
+                    extra.append(dup.select(pl.lit("duplicate_key").alias("reason"), pl.lit(",".join(keys)).alias("column"),
+                                            pl.concat_str([pl.col(k).cast(pl.String) for k in keys], separator="|").alias("key")))
+                    rows = numbered.filter(~pl.col("_r").is_in(dup["_r"].implode())).drop("_r")
+                    complete = complete.filter(~pl.col("_r").is_in(dup["_r"].implode()))
+            new_keys = complete.select(keys)
+            self.seen[tuple(keys)] = new_keys if before is None else pl.concat([before, new_keys])
+        if not extra:
+            return result
+        return TransformResult(rows=rows, exceptions=pl.concat([result.exceptions] + extra))
+
+
 def _results(batches , m : TableMapping , ctx : TransformContext , counters : dict , exception_frames : list ,
              progress=NULL_PROGRESS , on_batch=None):
     """Transform each batch as the loader asks for it, counting what was read.
     The generator is pulled by the loader, so the stage reported here is the real one:
     extract (fetching a batch) -> transform -> load (the loader writes it while we are suspended)."""
+    seen = SeenKeys(m)
     try:
         iterator = iter(batches)
         while True:
@@ -115,7 +147,7 @@ def _results(batches , m : TableMapping , ctx : TransformContext , counters : di
                 break
             counters["read"] += batch.height
             progress.table_stage(m.name, "transform")
-            result = transform_batch(batch, m, ctx)
+            result = seen.filter(transform_batch(batch, m, ctx))
             if result.exceptions.height:
                 exception_frames.append(result.exceptions)
             if on_batch is not None:

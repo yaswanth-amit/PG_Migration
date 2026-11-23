@@ -50,10 +50,6 @@ class TargetColumn:
         return value if kind == DEFAULT_LITERAL else None
 
     @property
-    def has_constant_default(self) -> bool:
-        return self.default_kind == DEFAULT_LITERAL
-
-    @property
     def db_generates_value(self) -> bool:
         """True when the database fills this column itself (sequence, identity or GENERATED ALWAYS)."""
         return self.generated or self.default_kind == DEFAULT_SEQUENCE

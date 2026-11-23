@@ -37,8 +37,7 @@ _SQL_FAMILY = {
     "datetimeoffset": "datetime",
     "uniqueidentifier": "guid", "varbinary": "binary", "binary": "binary", "image": "binary",
 }
-_INT_BITS = {"tinyint": 8, "smallint": 16, "int": 32, "bigint": 64,
-             "smallint_pg": 16, "integer": 32, "bigint_pg": 64}
+_INT_BITS = {"tinyint": 8, "smallint": 16, "int": 32, "bigint": 64}
 
 
 def sql_family(sql_type : str) -> str:

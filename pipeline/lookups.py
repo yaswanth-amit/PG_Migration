@@ -15,49 +15,6 @@ class LookupUse:
     ret : str                   # column that is returned, for example 'iot_id'
 
 
-def collect_lookup_uses(tables : dict[str, TableMapping]) -> set[LookupUse]:
-    """Every lookup used anywhere in the mappings."""
-    uses : set[LookupUse] = set()
-
-    for m in tables.values():
-        for col in m.columns:
-            if col.rule != "lookup":
-                continue
-
-            table = col.params["table"]
-            ret = col.params["return"]
-
-            # the normal match, and the extra match used for predefined down codes
-            for key_name in ("match", "predefined_match"):
-                match = col.params.get(key_name)
-                if isinstance(match, dict) and match:
-                    uses.add(LookupUse(table=table, keys=tuple(match.keys()), ret=ret))
-
-    return uses
-
-
-def check_lookups(pg_conn , tables : dict[str, TableMapping] , uses : set[LookupUse]) -> list[str]:
-    """Preflight: every looked-up table and column must exist in the target database."""
-    errors : list[str] = []
-    schemas_cache : dict[str, dict] = {}
-
-    for use in sorted(uses, key=lambda u: (u.table, u.keys, u.ret)):
-        if use.table not in tables:
-            errors.append(f"Lookup table '{use.table}' is not one of the mapped tables.")
-            continue
-
-        if use.table not in schemas_cache:
-            schema_name = (tables[use.table].raw.get("target") or {}).get("schema", "public")
-            schemas_cache[use.table] = read_target_schema(pg_conn, schema_name, tables[use.table].tgt_table)
-        target_cols = schemas_cache[use.table]
-
-        for column in (*use.keys, use.ret):
-            if column not in target_cols:
-                errors.append(f"Lookup on '{use.table}': column '{column}' does not exist in the target table.")
-
-    return errors
-
-
 class LookupCache:
     """Loads lookup frames from Postgres on first use and keeps them for the rest of the run.
 
@@ -112,25 +69,3 @@ class LookupCache:
             self.duplicate_keys[use] = duplicates
 
         return unique
-
-
-if __name__ == "__main__":
-    from pipeline.mapping_config import load_mappings
-    from pipeline.connections import target_connection
-
-    ms = load_mappings()
-    uses = collect_lookup_uses(ms.tables)
-    print(f"{len(uses)} distinct lookups used by the mappings")
-
-    with target_connection() as conn:
-        errors = check_lookups(conn, ms.tables, uses)
-        print(f"preflight errors: {len(errors)}")
-        for e in errors:
-            print("  ", e)
-
-        cache = LookupCache(conn, ms.tables)
-        # Only table names, keys and row counts are printed, never values.
-        for use in sorted(uses, key=lambda u: (u.table, u.keys, u.ret)):
-            frame = cache.get(use)
-            dup = cache.duplicate_keys.get(use, 0)
-            print(f"  {use.table:30s} on {','.join(use.keys):45s} -> {use.ret:12s} rows={frame.height:4d} duplicate_keys={dup}")
