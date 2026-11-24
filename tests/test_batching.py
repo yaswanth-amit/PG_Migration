@@ -141,7 +141,7 @@ def lookback_of(rows):
 
 
 def batch_cycles(all_rows, start, end, lookback):
-    """What extract_batch_icd_cycles returns, as plain Polars: candidate cycles starting in [start - lookback - 2 s, end)."""
+    """What extract_batch_prod_icd_cycles returns, as plain Polars: candidate cycles starting in [start - lookback - 2 s, end)."""
     c = candidates(all_rows)
     low = start - timedelta(seconds=lookback + ex.ICD_LOOKBACK_MARGIN_SECONDS)
     return c.filter((pl.col("sttime") >= low) & (pl.col("sttime") < end))

@@ -97,12 +97,12 @@ def build_select_sql(m : TableMapping , where : str | None = None , ordered : bo
 
 def extract_batches(conn , m : TableMapping , where : str | None = None , params : Sequence = () ,
                     batch_size : int = 50_000 , icd_lookback_seconds : int | None = None ,
-                    icd_cycles : pl.DataFrame | None = None) -> Iterator[pl.DataFrame]:
-    """Read rows in chunks. A table with the derived column is_icd needs icd_cycles (the candidate cycles):
+                    prod_icd_cycles : pl.DataFrame | None = None) -> Iterator[pl.DataFrame]:
+    """Read rows in chunks. A table with the derived column is_icd needs prod_icd_cycles (the candidate cycles):
     is_icd is computed here in the DataFrame by add_is_icd."""
-    in_frame = icd_cycles is not None
+    in_frame = prod_icd_cycles is not None
     if not in_frame and "is_icd" in derived_columns(m):
-        raise ValueError(f"Table '{m.name}': the derived rule 'is_icd' needs icd_cycles.")
+        raise ValueError(f"Table '{m.name}': the derived rule 'is_icd' needs prod_icd_cycles.")
     sql = build_select_sql(m, where=where)
     cursor = conn.cursor()
     try:
@@ -136,7 +136,7 @@ def extract_batches(conn , m : TableMapping , where : str | None = None , params
                     df = df.cast(fix)
 
             if in_frame:
-                df = add_is_icd(df, icd_cycles, icd_lookback_seconds or 0)
+                df = add_is_icd(df, prod_icd_cycles, icd_lookback_seconds or 0)
             yield df
     finally:
         cursor.close()
@@ -211,7 +211,7 @@ def list_machines(conn , m : TableMapping) -> list[str]:
         cursor.close()
 
 
-def extract_batch_icd_cycles(conn , m : TableMapping , machines : Sequence[str] , start : datetime | None ,
+def extract_batch_prod_icd_cycles(conn , m : TableMapping , machines : Sequence[str] , start : datetime | None ,
                              end : datetime | None , lookback_seconds : int) -> pl.DataFrame:
     """The cycles (datatype 1, longer than their cycletime) that can contain a down row OWNED by the batch
     [start, end): the cycles that start in the batch, plus the cycles that started EARLIER and run into it

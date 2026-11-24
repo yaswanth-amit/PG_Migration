@@ -15,6 +15,7 @@ import polars as pl
 from pipeline import batching
 from pipeline import extract as ex
 from pipeline import load as ld
+from pipeline import maxtime as mt
 from pipeline import tracking
 from pipeline.log_setup import get_logger, log_context, setup_logging
 from pipeline.lookups import LookupCache
@@ -467,6 +468,15 @@ def _run_window_table(m , ctx , outcome , options , src_conn , tgt_conn , tracke
         machines = ex.list_machines(src_conn, m)                                # the cycles are read per batch
         log.info("is_icd: candidate cycles are read per batch for %d machine(s)", len(machines))
 
+    # autodata_maxtime: one global DataFrame keeps the latest row of each machine over ALL windows
+    max_cfg = m.raw.get("maxtime_target")
+    max_tracker = None
+    if max_cfg:
+        max_tracker = mt.MaxTimeTracker(max_cfg.get("schema", "production_core"), max_cfg["table"])
+        if done:                                    # windows of an earlier run are skipped: read their latest rows from the target
+            seeded = max_tracker.seed_from_target(tgt_conn, ld.target_schema_name(m), m.tgt_table)
+            log.info("maxtime: %d machine(s) taken from the windows an earlier run completed", seeded)
+
     expected_total = 0
     for number, (w_start, w_end) in enumerate(windows, start=1):
         where, params = ex.window_condition(column, w_start, w_end)
@@ -488,16 +498,18 @@ def _run_window_table(m , ctx , outcome , options , src_conn , tgt_conn , tracke
                 # is_icd is computed here in the DataFrame: the same rule as in SQL, but the SQL version takes
                 # minutes per window on a large table. A cycle that started in an EARLIER batch and runs into this
                 # one is fetched as context (never loaded again) so the down rows of this batch can be flagged.
-                icd_cycles = None
+                prod_icd_cycles = None
                 if lookback is not None:
-                    icd_cycles = ex.extract_batch_icd_cycles(src_conn, m, machines, w_start, w_end, lookback)
+                    prod_icd_cycles = ex.extract_batch_prod_icd_cycles(src_conn, m, machines, w_start, w_end, lookback)
                 batches = ex.extract_batches(src_conn, m, where, params, batch_size=options.batch_size,
-                                             icd_lookback_seconds=lookback, icd_cycles=icd_cycles)
+                                             icd_lookback_seconds=lookback, prod_icd_cycles=prod_icd_cycles)
                 base_read, base_exc = outcome.rows_read, outcome.rows_excepted
                 results = _results(batches, m, ctx, counters, exception_frames, progress,
                                    on_batch=lambda: progress.table_progress(
                                        m.name, base_read + counters["read"],
                                        base_exc + sum(f.height for f in exception_frames), outcome.windows_done))
+                if max_tracker is not None:
+                    results = mt.tap(results, max_tracker)
 
                 def record_in_transaction(conn , summary , number=number , counters=counters):
                     tracking.write_window_result(conn, run_id, m.name, number, counters["read"],
@@ -548,6 +560,16 @@ def _run_window_table(m , ctx , outcome , options , src_conn , tgt_conn , tracke
             whole = ex.count_source_rows(src_conn, m)
             if whole != expected_total:
                 raise ValueError(f"the batches hold {expected_total} rows but the source table has {whole}.")
+
+    if max_tracker is not None and max_tracker.frame is not None:   # all windows are done: insert the global frame
+        progress.table_stage(m.name, "record")
+        if real:
+            written = max_tracker.write(tgt_conn)
+            tgt_conn.commit()
+        else:
+            with tgt_conn.transaction():
+                written = max_tracker.write(tgt_conn)
+        log.info("%s: %d machine(s) written%s", max_tracker.table, written, "" if real else " (rehearsal, rolled back)")
 
     tracker.finish_table(run_id, m.name, outcome.rows_read, outcome.rows_loaded, outcome.rows_excepted,
                          ctx_misses(m, ctx), None)

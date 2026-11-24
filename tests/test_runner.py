@@ -15,6 +15,7 @@ from unittest import mock
 
 import polars as pl
 
+from pipeline import maxtime as mt
 from pipeline import batching
 from pipeline import extract as ex
 from pipeline import load as ld
@@ -97,12 +98,13 @@ class Harness:
         self.combined_count = combined_count
         self.fail_references = fail_references
         self.icd_cycle_calls, self.logical_calls = [], []
+        self.maxtime_frames = []
         self.target_has_window = True       # does the target still hold rows of a window the history calls completed?
         self.tgt = FakeTgt()
         self.cache = mock.MagicMock()
 
     # ---- fakes
-    def extract_batches(self, conn, m, where=None, params=(), batch_size=0, icd_lookback_seconds=None, icd_cycles=None):
+    def extract_batches(self, conn, m, where=None, params=(), batch_size=0, icd_lookback_seconds=None, prod_icd_cycles=None):
         def gen():
             yield pl.DataFrame({"x": [1, 2]})
         return gen()
@@ -150,13 +152,17 @@ class Harness:
     def window_has_rows(self, conn, m, start, end):
         return self.target_has_window
 
-    def batch_icd_cycles(self, conn, m, machines, start, end, lookback):
+    def batch_prod_icd_cycles(self, conn, m, machines, start, end, lookback):
         self.icd_cycle_calls.append((list(machines), start, end, lookback))
         return pl.DataFrame()
 
     def logical_windows(self, conn, low, high, start=None, end=None, months=1, include_null_window=True):
         self.logical_calls.append((low, high, start, end, months))
         return ex.generate_windows(JAN1, datetime(2026, 1, 20), 15, include_null_window=include_null_window)
+
+    def maxtime_write(self, tracker_self, conn):
+        self.maxtime_frames.append(tracker_self.frame.clone() if tracker_self.frame is not None else None)
+        return 0 if tracker_self.frame is None else tracker_self.frame.height
 
     def assert_target_empty(self, conn, schema, table):
         self.asserted_empty.append(table)
@@ -173,12 +179,14 @@ class Harness:
             stack.enter_context(mock.patch.object(ex, "count_source_rows", self.count_source_rows))
             stack.enter_context(mock.patch.object(ex, "compute_icd_lookback", lambda *a: 100))
             stack.enter_context(mock.patch.object(ex, "list_machines", lambda *a: ["M1", "M2"]))
-            stack.enter_context(mock.patch.object(ex, "extract_batch_icd_cycles", self.batch_icd_cycles))
+            stack.enter_context(mock.patch.object(ex, "extract_batch_prod_icd_cycles", self.batch_prod_icd_cycles))
             stack.enter_context(mock.patch.object(batching, "logical_month_windows", self.logical_windows))
             stack.enter_context(mock.patch.object(ld, "load_table", self.load_table))
             stack.enter_context(mock.patch.object(ld, "load_window", self.load_window))
             stack.enter_context(mock.patch.object(ld, "assert_target_empty", self.assert_target_empty))
             stack.enter_context(mock.patch.object(ld, "window_has_rows", self.window_has_rows))
+            stack.enter_context(mock.patch.object(mt.MaxTimeTracker, "seed_from_target", lambda *a, **k: 0))
+            stack.enter_context(mock.patch.object(mt.MaxTimeTracker, "write", lambda tr, conn: self.maxtime_write(tr, conn)))
             stack.enter_context(mock.patch.object(tracking, "write_table_result", self.write_table_result))
             stack.enter_context(mock.patch.object(tracking, "write_window_result", self.write_window_result))
             stack.enter_context(mock.patch.object(runner, "transform_batch", self.transform_batch))
@@ -427,3 +435,17 @@ if __name__ == "__main__":
             print(f"  FAIL  {name}: {type(e).__name__}: {e}")
     print(f"\n{len(tests) - failed} passed, {failed} failed")
     raise SystemExit(1 if failed else 0)
+
+
+def test_autodata_maxtime_is_written_once_at_the_end_with_the_latest_row_of_each_machine():
+    h = Harness()
+    t = lambda hour: datetime(2026, 1, 2, hour)
+    chunks = iter([
+        pl.DataFrame({"machine_iot_id": [1, 2], "datatype": [1, 1], "st_time": [t(1), t(1)], "nd_time": [t(2), t(9)]}),
+        pl.DataFrame({"machine_iot_id": [1, 2], "datatype": [1, 1], "st_time": [t(5), t(2)], "nd_time": [t(6), t(3)]}),
+    ])
+    h.extract_batches = lambda *a, **k: (c for c in [next(chunks)])
+    h.run(["autodata"], tracker=RecordingTracker(completed=AUTODATA_PARENTS), max_windows=2)
+    assert len(h.maxtime_frames) == 1                                  # one write, after all windows
+    got = {r["machine_iot_id"]: r["nd_time"] for r in h.maxtime_frames[0].iter_rows(named=True)}
+    assert got == {1: t(6), 2: t(9)}

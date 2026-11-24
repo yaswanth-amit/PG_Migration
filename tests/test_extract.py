@@ -110,7 +110,7 @@ def test_a_table_with_is_icd_needs_the_candidate_cycles():
     try:
         next(extract.extract_batches(None, T["autodata"]))
     except ValueError as e:
-        assert "icd_cycles" in str(e)
+        assert "prod_icd_cycles" in str(e)
     else:
         raise AssertionError("is_icd without candidate cycles must be refused")
 
