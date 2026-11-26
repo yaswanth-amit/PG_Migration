@@ -120,6 +120,37 @@ def _rule_aggregated(col : ColumnRule, ctx : TransformContext, schema : dict) ->
     return pl.col(col.src)
 
 
+def _shift_seconds(ctx : TransformContext , ret : str) -> dict[str, int]:
+    """shift name -> seconds since midnight of the shift_details time column `ret` (from_time or to_time)."""
+    frame = ctx.lookups.get(LookupUse(table="shift_details", keys=("shift_name",), ret=ret))
+    return {n: v.hour * 3600 + v.minute * 60 + v.second
+            for n, v in zip(frame["shift_name"], frame[ret]) if v is not None}
+
+
+def _rule_shift_time(col : ColumnRule, ctx : TransformContext, schema : dict) -> pl.Expr:
+    """The source value when it has one, else the shift's start (part: start) or end (part: end) on the date.
+    Old rows have no ShiftStart / ShiftEnd; shift_details holds the shift's time of day, and to_day = 1 when the shift
+    ends on the next day (the third shift, 22:00 - 06:00). Same rule as the live aggregation: date + shift time."""
+    if ctx.lookups is None:
+        raise ValueError(f"Rule 'shift_time' ('{col.dst}') needs lookups for shift_details.")
+    part = col.params["part"]
+    if part not in ("start", "end"):
+        raise ValueError(f"Column '{col.dst}': shift_time part must be 'start' or 'end', not '{part}'.")
+    shift = pl.col(col.params["shift"])
+    base = pl.col(col.params["date"]).cast(pl.Datetime("us")).dt.truncate("1d")
+    if part == "start":
+        derived = base + pl.duration(seconds=shift.replace_strict(_shift_seconds(ctx, "from_time"),
+                                                                  default=None, return_dtype=pl.Int64))
+    else:
+        days = ctx.lookups.get(LookupUse(table="shift_details", keys=("shift_name",), ret="to_day"))
+        day_map = {n: int(v) for n, v in zip(days["shift_name"], days["to_day"]) if v is not None}
+        derived = (base
+                   + pl.duration(days=shift.replace_strict(day_map, default=0, return_dtype=pl.Int64))
+                   + pl.duration(seconds=shift.replace_strict(_shift_seconds(ctx, "to_time"),
+                                                              default=None, return_dtype=pl.Int64)))
+    return pl.coalesce([pl.col(col.src), derived])
+
+
 def _rule_derived(col : ColumnRule, ctx : TransformContext, schema : dict) -> pl.Expr:
     name = col.params["name"]
     if name not in schema:
@@ -142,6 +173,7 @@ RULE_BUILDERS = {
     "first_non_null": _rule_aggregated,
     "max": _rule_aggregated,
     "derived": _rule_derived,
+    "shift_time": _rule_shift_time,
     # "lookup" is a join (see _apply_lookup) and "omit" writes nothing
 }
 
@@ -155,7 +187,12 @@ def _apply_when(expr : pl.Expr , col : ColumnRule) -> pl.Expr:
 
 
 def _apply_null_as(expr : pl.Expr , col : ColumnRule , ctx : TransformContext) -> pl.Expr:
-    """null_as: ddl_default -> a NULL becomes the column's default in the target database."""
+    """null_as: zero -> a NULL becomes 0 (the live aggregation fills these columns with COALESCE(..., 0)).
+    null_as: ddl_default -> a NULL becomes the column's default in the target database."""
+    if col.params.get("null_as") == "zero":
+        return expr.fill_null(0)
+    if col.params.get("null_as") is False:                  # YAML  null_as: false  -> a NULL flag is false
+        return expr.fill_null(False)
     if col.params.get("null_as") != "ddl_default":
         return expr
 
@@ -342,6 +379,8 @@ def transform_batch(df : pl.DataFrame , m : TableMapping , ctx : TransformContex
 
         if col.rule == "lookup":
             work = _apply_lookup(work, col, ctx, m)
+            if "null_as" in col.params:                   # a lookup that finds nothing can still give 0 / false
+                work = work.with_columns(_apply_null_as(pl.col(T + col.dst), col, ctx).alias(T + col.dst))
             if col.params.get("on_miss") == "drop":
                 mask_col = f"__m{len(masks)}"
                 work = work.with_columns(pl.col(T + col.dst + MISS_SUFFIX).alias(mask_col))

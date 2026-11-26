@@ -1,0 +1,168 @@
+# Mapping: dbo.ShiftProductionDetails (SQL Server) -> analytics_historic.shift_production_down_details (PostgreSQL)
+# Status: DRAFT. The PRODUCTION columns come from ShiftProductionDetails. The DOWN columns of the same target row
+# (net_downtime, management_loss, ...) are computed in Polars from dbo.ShiftDownTimeDetails (see down_aggregate below).
+# Wave: after master_data. Conventions (null handling, no dropped rows, lookups): see ../master_data/_conventions.yaml
+#
+# Checked on 2026-11-25 against the live pair TPM_PGSQL (source) and tpm_baseline_qa (target):
+#   - the source IDs in this table are the plain ids (MachineID 'CNC-01', ComponentID 'Small Cycle Time'), not interface ids,
+#     so the lookups match on machine_id / component_id / plant_id / group_id / employee_id (like plant_machine.yaml does)
+#   - the target row is one row per (date, shift, plant, group, machine, component, operation, operator, work order, heat code)
+
+source:
+  database: TPM_PGSQL
+  schema: dbo
+  table: ShiftProductionDetails
+  natural_key: [ID]
+
+target:
+  schema: analytics_historic
+  table: shift_production_down_details
+  primary_key: [id, production_date]            # id has a default sequence; the table is a TimescaleDB hypertable on production_date
+  unique: [[production_date, shift_name, plant_iot_id, group_iot_id, machine_iot_id, component_iot_id, operation_number, operator_iot_id, work_order_number, heat_code]]
+  dedupe: [[production_date, shift_name, plant_iot_id, group_iot_id, machine_iot_id, component_iot_id, operation_number, operator_iot_id, work_order_number, heat_code]]   # unique index uq_shift_production_down_details_key: first row of a key stays, the rest are listed as duplicate_key
+
+depends_on: [plant_information, plant_groups, machine_information, component_information, component_operation_pricing, employee_information, shift_details]
+
+# The DOWN columns are computed in the pipeline (pipeline/down_aggregate.py), per window, from the SOURCE table of the down
+# rows: no second target table and no SQL file are needed. Per production key the rows of ShiftDownTimeDetails are summed;
+# a key with down rows but no production row becomes a new row with zero production (the live table has such rows).
+down_aggregate:
+  source_table: ShiftDownTimeDetails
+  date_column: dDate                 # the same window as pDate
+  key:                               # production source column -> down source column
+    pDate: dDate
+    Shift: Shift
+    PlantID: PlantID
+    GroupID: GroupID
+    MachineID: MachineID
+    ComponentID: ComponentID
+    OperationNo: OperationNo
+    OperatorID: OperatorID
+    WorkOrderNumber: WorkOrderNumber     # NULL counts as '0'
+    HeatCode: HeatCode                   # NULL counts as '0'
+  flag_master:                       # an older ShiftDownTimeDetails has no prodeffy / ThresholdfromCO on the row:
+    table: downcodeinformation       # then they are taken from the down code master by DownID (as the live procedure does:
+    match: {DownID: downid}          # down_code_information.production_efficiency / threshold_from_co), child column: master column
+  extra_row_columns:                 # filled on a new row from the down rows
+    ShiftStart: ShiftStart
+    ShiftEnd: ShiftEnd
+  extra_row_values:                  # constants of a new row
+    UpdatedBy: migration
+    UpdatedTS: now
+
+batching:
+  strategy: date_window
+  mode: days                           # production_date is a plain date, so fixed windows are enough (no logical-day cut needed)
+  days: 30                             # the target hypertable has a 30-day chunk interval
+  column: pDate                        # source column that decides the window
+  boundaries: half_open                # pDate >= start AND pDate < end
+  null_window: false                   # pDate is NOT NULL in the source
+
+columns:
+  # --- when ---
+  - {dst: production_date,   src: pDate,      rule: copy}                  # datetime NN -> timestamp NN
+  - {dst: shift_name,        src: Shift,      rule: copy}                  # nvarchar(20) NN -> text NN
+  - {dst: shift_start_time,  src: ShiftStart, rule: shift_time, part: start, date: pDate, shift: Shift}   # old rows have no ShiftStart: pDate + the shift's start from shift_details
+  - {dst: shift_end_time,    src: ShiftEnd,   rule: shift_time, part: end,   date: pDate, shift: Shift}   # likewise; the third shift ends on the next day (to_day = 1)
+  - {dst: shift_id,          src: Shift,      rule: lookup, table: shift_details, match: {shift_name: Shift}, return: shift_id}   # 'Shift-A' -> 1
+
+  # --- who / what: iot ids first, then the text ids kept beside them (the target holds both) ---
+  - {dst: plant_iot_id,      src: PlantID,     rule: lookup, table: plant_information,   match: {plant_id: PlantID},     return: iot_id}
+  - {dst: group_iot_id,      src: GroupID,     rule: lookup, table: plant_groups,        match: {group_id: GroupID},     return: iot_id}
+  - {dst: machine_iot_id,    src: MachineID,   rule: lookup, table: machine_information, match: {machine_id: MachineID}, return: iot_id}     # target NOT NULL
+  - {dst: component_iot_id,  src: ComponentID, rule: lookup, table: component_information, match: {component_id: ComponentID}, return: iot_id}   # target NOT NULL
+  - {dst: operation_iot_id,  src: OperationNo, rule: lookup, table: component_operation_pricing, match: {machine_iot_id: "@machine_iot_id", component_iot_id: "@component_iot_id", operation_no: OperationNo}, return: iot_id}   # target NOT NULL
+  - {dst: operator_iot_id,   src: OperatorID,  rule: lookup, table: employee_information, match: {employee_id: OperatorID}, return: iot_id}   # target NOT NULL
+  - {dst: plant_id,          src: PlantID,     rule: copy}
+  - {dst: group_id,          src: GroupID,     rule: copy}
+  - {dst: machine_id,        src: MachineID,   rule: copy}
+  - {dst: component_id,      src: ComponentID, rule: copy}
+  - {dst: operation_number,  src: OperationNo, rule: copy}                 # int -> integer
+  - {dst: operator_id,       src: OperatorID,  rule: copy}
+  - {dst: work_order_number, src: WorkOrderNumber, rule: coalesce, fallback: "0"}   # NN in the source; the target default is '0'
+  - {dst: heat_code,         src: HeatCode,        rule: coalesce, fallback: "0"}   # NULL becomes '0', like the live aggregation does
+
+  # --- quantities ---
+  - {dst: production_quantity,       src: Prod_Qty,        rule: cast, to: "numeric(18,5)", null_as: zero}   # float -> numeric(18,5), through its decimal text
+  - {dst: accepted_parts_quantity,   src: AcceptedParts,   rule: cast, to: "numeric(18,5)", null_as: zero}
+  - {dst: rework_performed_count,    src: Rework_Performed,  rule: copy, null_as: zero}   # int -> integer
+  - {dst: marked_for_rework_count,   src: Marked_for_Rework, rule: copy, null_as: zero}   # int -> integer
+  - {dst: repeat_cycles,             src: Repeat_Cycles,   rule: copy}     # int -> integer
+  - {dst: dummy_cycles,              src: Dummy_Cycles,    rule: copy}     # int -> integer
+
+  # --- times (seconds) ---
+  - {dst: total_actual_cycle_time,         src: Sum_of_ActCycleTime,  rule: cast, to: "numeric(18,5)", null_as: zero}
+  - {dst: total_actual_load_unload_time,   src: Sum_of_ActLoadUnload, rule: cast, to: "numeric(18,5)", null_as: zero}
+  - {dst: actual_machining_time_type12,    src: ActMachiningTime_Type12, rule: cast, to: "numeric(18,5)", null_as: zero}
+  - {dst: actual_load_unload_time_type12,  src: ActLoadUnload_Type12,    rule: cast, to: "numeric(18,5)", null_as: zero}
+  - {dst: max_machining_time,    src: MaxMachiningTime,  rule: cast, to: "numeric(18,5)"}
+  - {dst: min_machining_time,    src: MinMachiningTime,  rule: cast, to: "numeric(18,5)"}
+  - {dst: max_load_unload_time,  src: MaxLoadUnloadTime, rule: cast, to: "numeric(18,5)"}
+  - {dst: min_load_unload_time,  src: MinLoadUnloadTime, rule: cast, to: "numeric(18,5)"}
+  - {dst: production_planned_downtime, src: PDT, rule: cast, to: "numeric(18,5)", null_as: zero}   # float -> numeric; NULL stays NULL (see open_questions)
+
+  # --- derived ---
+  - {dst: cn, src: null, rule: derived, name: cn, null_as: zero}                        # see derived_rules.cn; computed in Polars (pipeline/extract.py add_cn)
+
+  # --- down columns: summed from ShiftDownTimeDetails per key (down_aggregate; rules in derived_rules.down_columns) ---
+  - {dst: net_downtime, src: null, rule: derived, name: net_downtime, null_as: zero}
+  - {dst: management_loss, src: null, rule: derived, name: management_loss, null_as: zero}
+  - {dst: operator_loss, src: null, rule: derived, name: operator_loss, null_as: zero}
+  - {dst: total_minor_downtime, src: null, rule: derived, name: total_minor_downtime, null_as: zero}
+  - {dst: down_planned_downtime, src: null, rule: derived, name: down_planned_downtime, null_as: zero}
+  - {dst: management_loss_planned_downtime, src: null, rule: derived, name: management_loss_planned_downtime, null_as: zero}
+  - {dst: operator_loss_planned_downtime, src: null, rule: derived, name: operator_loss_planned_downtime, null_as: zero}
+  - {dst: count_planned_downtime, src: null, rule: constant, value: 0}   # no source holds the parts made inside a planned downtime
+
+  # --- energy ---
+  - {dst: kilowatt_hours,      src: KWH,               rule: cast, to: "numeric(18,5)"}
+  - {dst: spindle_run_time,    src: SpindleRunTime,    rule: cast, to: "numeric(18,5)"}
+  - {dst: energy_consumption,  src: EnergyConsumption, rule: cast, to: "numeric(18,5)"}
+
+  # --- master data copied into the row ---
+  - {dst: standard_machining_time,   src: CO_StdMachiningTime, rule: cast, to: "numeric(18,5)"}
+  - {dst: standard_load_unload_time, src: CO_StdLoadUnload,    rule: cast, to: "numeric(18,5)"}
+  - {dst: finished_operation_flag,   src: FinishedOperation,   rule: bool}   # int -> boolean; 0 = false
+  - {dst: sub_operation_number,      src: SubOperation,        rule: copy}   # int -> integer
+  - {dst: price,                     src: Price,               rule: cast, to: "numeric(18,5)"}
+  - {dst: machine_owner,             src: MachinewiseOwner,    rule: copy}
+  - {dst: is_critical_machine,       src: CriticalMachineEnabled, rule: bool}   # bit -> boolean
+  - {dst: machine_hour_rate,         src: mchrrate,            rule: cast, to: "numeric(18,5)"}
+  - {dst: incentive_time,            src: IncentiveTime,       rule: cast, to: "numeric(18,5)"}
+  - {dst: updated_by,                src: UpdatedBy,           rule: copy}
+  - {dst: updated_at,                src: UpdatedTS,           rule: copy}
+
+# Target columns not written by this file
+defaults:
+  id: sequence shift_production_down_details_id_seq          # generated by the target
+  # target: never written by the live aggregation either (NULL on every live row)
+
+# Source columns with no target
+unmapped_source:
+  - ID    # bigint NN - the target generates its own id
+
+derived_rules:
+  down_columns:
+    where: "pipeline/down_aggregate.py, per window; the keys of ShiftDownTimeDetails are matched to ShiftProductionDetails on the 10 key columns (down_aggregate.key)"
+    rules: "net_downtime = SUM(DownTime); down_planned_downtime = SUM(PDT); management_loss = SUM(cap(DownTime)) over ML_Flag rows; management_loss_planned_downtime = SUM(cap(DownTime+PDT) - cap(DownTime)) over ML_Flag rows; operator_loss = SUM(DownTime) over prodeffy and not ThresholdfromCO rows; operator_loss_planned_downtime = SUM(PDT) over the same rows; total_minor_downtime = SUM(DownTime + PDT) over PE_Flag rows (gross, as the live procedure keeps it); cap(x) = Threshold when Threshold > 0 and x > Threshold, else x"
+    no_down_rows: "0 (the live aggregation fills these columns with COALESCE(..., 0))"
+    verified: "2026-11-25: the same formulas, written in SQL, equalled all 7 live columns on all 141 rows of tpm_baseline_qa."
+    new_rows: "a key with down rows but no production row is added with zero production, updated_by 'migration' (down_aggregate.extra_row_values)"
+  cn:
+    type: "numeric(18,5)"
+    rule: "cn = Prod_Qty * (CO_StdMachiningTime + CO_StdLoadUnload) / SubOperation; a NULL or 0 SubOperation counts as 1; a NULL input gives NULL"
+    live_equivalent: "etl.load_agg_prod_summary_from_autodata: SUM((std_cycletime / COALESCE(sub_operation,1)) * part_count) FILTER (datatype = 1 AND shift_cycle_type IN ('type_1','type_2') AND NOT in_pdt)"
+    implementation: "Polars, per chunk (pipeline/extract.py add_cn). Uses the source columns Prod_Qty, CO_StdMachiningTime, CO_StdLoadUnload, SubOperation, which this mapping already reads."
+    verified: "2026-11-13, all 10 live rows: for example 12 * (60 + 30) / 1 = 1080 and 117 * (180 + 30) / 1 = 24570."
+    note: "the live value leaves out parts made inside a planned downtime (in_pdt); this source table has no count of them, so on a row with planned-downtime parts cn here can be higher than the live one."
+
+open_questions:
+  - "The live aggregation recomputes planned downtime (PDT) and ICD handling in the new system, so some of its values differ from the source ones: on 2026-11-13 total_actual_cycle_time is lower by the planned downtime on two rows, and min/max machining and load/unload times differ on a few rows. This mapping copies the SOURCE values; the target will not match the live recomputation on those rows. Decide whether the source or the recomputed values are the correct ones."
+  - "The live target already holds rows written by its own aggregation service. A window load deletes the target rows of its date range first, so a run against that target would delete live rows. Run it against an empty target only."
+  - "kilowatt_hours, spindle_run_time and energy_consumption are NULL in the live target (the live procedure leaves them out). This mapping copies the source values."
+  - "Rows whose plant, group, machine, component, operation or operator cannot be found in the master tables are listed as exceptions (the iot id columns that are NOT NULL cannot be loaded)."
+
+checks:
+  - "machine_iot_id, component_iot_id, operation_iot_id and operator_iot_id are resolved for every row"   # NOT NULL in the target
+  - "the dimension key is unique"                       # unique index in the target; source distinct keys equal row count on TPM_PGSQL (91 of 91), but the old database had 9,759 duplicates
+  - "rows read = rows loaded + exceptions"

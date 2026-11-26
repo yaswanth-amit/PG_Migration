@@ -1,0 +1,113 @@
+# Mapping: dbo.ShiftDownTimeDetails (SQL Server) -> analytics_historic.shift_down_time_details (PostgreSQL)
+# Status: DRAFT - awaiting owner decisions (see open_questions)
+# Wave: after master_data. Conventions (null handling, no dropped rows, lookups): see ../master_data/_conventions.yaml
+#
+# Checked on 2026-11-25 against the live pair TPM_PGSQL (source) and tpm_baseline_qa (target):
+#   - DownTime and PDT in the source already follow the target's split: down_time = down time WITHOUT the planned part,
+#     planned_down_time = the planned part (for example source DownTime 0 / PDT 126 equals target down_time 0 / planned 126)
+#   - ids are plain ids (MachineID 'CNC-01'), so lookups match on machine_id / component_id / plant_id / group_id / employee_id
+#   - the live aggregation takes down_id, down_category and threshold from the MASTER down code (see open_questions)
+
+source:
+  database: TPM_PGSQL
+  schema: dbo
+  table: ShiftDownTimeDetails
+  natural_key: [ID]
+
+target:
+  schema: analytics_historic
+  table: shift_down_time_details
+  primary_key: [id]                             # id has a default sequence; the table is a TimescaleDB hypertable on down_date
+  unique: [[down_date, shift_id, plant_iot_id, group_iot_id, machine_iot_id, component_iot_id, operation_number, operator_iot_id, work_order_number, heat_code, start_time]]
+  dedupe: [[down_date, shift_id, plant_iot_id, group_iot_id, machine_iot_id, component_iot_id, operation_number, operator_iot_id, work_order_number, heat_code, start_time]]   # unique index uq_shift_down_time_details_key: first row of a key stays, the rest are listed as duplicate_key
+
+depends_on: [plant_information, plant_groups, machine_information, component_information, component_operation_pricing, employee_information, shift_details, down_code_information]
+
+extra_source_tables:
+  - table: PredefinedDownCodeInfo      # DownId nvarchar NN; read once, to recognise predefined down codes (NO_DATA, McTI, ...)
+    used_for: down_iot_id, down_id
+
+batching:
+  strategy: date_window
+  mode: days                           # down_date is a plain date, so fixed windows are enough
+  days: 30                             # the target hypertable has a 30-day chunk interval
+  column: dDate                        # source column that decides the window
+  boundaries: half_open                # dDate >= start AND dDate < end
+  null_window: true                    # dDate is nullable in the source but NOT NULL in the target: such rows are read and listed as exceptions
+
+columns:
+  # --- when ---
+  - {dst: down_date,    src: dDate,      rule: copy}                   # datetime -> timestamp NN
+  - {dst: shift_name,   src: Shift,      rule: copy}
+  - {dst: shift_start,  src: ShiftStart, rule: shift_time, part: start, date: dDate, shift: Shift}   # old rows have no ShiftStart: dDate + the shift's start from shift_details
+  - {dst: shift_end,    src: ShiftEnd,   rule: shift_time, part: end,   date: dDate, shift: Shift}   # likewise; the third shift ends on the next day
+  - {dst: shift_id,     src: Shift,      rule: lookup, table: shift_details, match: {shift_name: Shift}, return: shift_id}   # 'Shift-A' -> 1
+  - {dst: start_time,   src: StartTime,  rule: copy}                   # datetime NN -> timestamp NN
+  - {dst: end_time,     src: EndTime,    rule: copy}                   # datetime NN -> timestamp NN
+
+  # --- who / what ---
+  - {dst: plant_iot_id,      src: PlantID,     rule: lookup, table: plant_information,      match: {plant_id: PlantID},         return: iot_id}
+  - {dst: group_iot_id,      src: GroupID,     rule: lookup, table: plant_groups,           match: {group_id: GroupID},         return: iot_id}
+  - {dst: machine_iot_id,    src: MachineID,   rule: lookup, table: machine_information,    match: {machine_id: MachineID},     return: iot_id}   # target NOT NULL
+  - {dst: component_iot_id,  src: ComponentID, rule: lookup, table: component_information, match: {component_id: ComponentID}, return: iot_id}
+  - {dst: operation_iot_id,  src: OperationNo, rule: lookup, table: component_operation_pricing, match: {machine_iot_id: "@machine_iot_id", component_iot_id: "@component_iot_id", operation_no: OperationNo}, return: iot_id}
+  - {dst: operator_iot_id,   src: OperatorID,  rule: lookup, table: employee_information,   match: {employee_id: OperatorID},   return: iot_id}
+  - {dst: plant_id,          src: PlantID,     rule: copy}
+  - {dst: group_id,          src: GroupID,     rule: copy}
+  - {dst: machine_id,        src: MachineID,   rule: copy}
+  - {dst: component_id,      src: ComponentID, rule: copy}
+  - {dst: operation_number,  src: OperationNo, rule: copy}
+  - {dst: operator_id,       src: OperatorID,  rule: copy}
+  - {dst: work_order_number, src: WorkOrderNumber, rule: coalesce, fallback: "0"}   # NN in the source; the target default is '0'
+  - {dst: heat_code,         src: HeatCode,        rule: coalesce, fallback: "0"}   # NULL becomes '0', like the live aggregation does
+
+  # --- the down code ---
+  # Predefined codes (NO_DATA, McTI, ...) are matched by name, ignoring case; the master spells them in lower case ('no_data', 'mcti').
+  - {dst: down_iot_id, src: DownID, rule: lookup, table: down_code_information, match: {down_id: DownID}, predefined_match: {down_id: DownID}, predefined_names_from: PredefinedDownCodeInfo.DownId, return: iot_id}
+  - {dst: down_id,     src: DownID, rule: lookup, table: down_code_information, match: {down_id: DownID}, predefined_match: {down_id: DownID}, predefined_names_from: PredefinedDownCodeInfo.DownId, return: down_id, report_miss: false}   # the master's spelling, as the live aggregation stores it ('no_data'); a code not in the master becomes NULL
+  - {dst: down_category, src: DownCategory, rule: copy}                  # see open_questions: the live value comes from the master, spelled differently
+
+  # --- time and quantities ---
+  - {dst: down_time,         src: DownTime, rule: copy}                  # bigint -> bigint (already without the planned part)
+  - {dst: planned_down_time, src: PDT,      rule: cast, to: "numeric(18,5)"}   # float -> numeric(18,5)
+  - {dst: kilowatt_hours,    src: KWH,      rule: cast, to: "numeric(18,5)"}
+  - {dst: turn_over,         src: TurnOver, rule: cast, to: "numeric(18,5)"}
+  - {dst: standard_setup_time, src: StdSetupTime, rule: cast, to: "numeric(18,5)"}
+  - {dst: threshold,         src: Threshold, rule: copy}                 # numeric(18,0) -> numeric (see open_questions)
+
+  # --- flags (tinyint / int / bit -> boolean; NULL = false, like the live aggregation) ---
+  # prod_effy and threshold_from_co are per down CODE, not per down row: they come from the down code master (down_code_information),
+  # the way etl.load_agg_prod_summary_from_autodata sets them. Both source schemas then work (TPM_PGSQL has the columns on the row, Kiswok_11Dec2025 only on the code).
+  - {dst: ml_flag,                    src: ML_Flag,           rule: bool, null_as: false}   # management loss
+  - {dst: pe_flag,                    src: PE_Flag,           rule: bool, null_as: false}   # minor down (live: minor_down_flag)
+  - {dst: prod_effy,                  src: DownID, rule: lookup, table: down_code_information, match: {down_id: DownID}, predefined_match: {down_id: DownID}, predefined_names_from: PredefinedDownCodeInfo.DownId, return: production_efficiency, report_miss: false, null_as: false}   # operator loss (live: ol_flag): from the down code master, as the live procedure does; an older ShiftDownTimeDetails has no prodeffy column
+  - {dst: exclude_from_target,        src: ExcludeFromTarget, rule: bool, null_as: false}
+  - {dst: threshold_from_co,          src: DownID, rule: lookup, table: down_code_information, match: {down_id: DownID}, predefined_match: {down_id: DownID}, predefined_names_from: PredefinedDownCodeInfo.DownId, return: threshold_from_co, report_miss: false, null_as: false}   # from the down code master (live: down_code_information.threshold_from_co); an older ShiftDownTimeDetails has no ThresholdfromCO column
+  - {dst: ret_per_machine_hour_flag,  src: RetPerMcHour_Flag, rule: bool, null_as: false}
+  - {dst: critical_machine_enabled,   src: CriticalMachineEnabled, rule: bool, null_as: false}
+
+  # --- notes and audit ---
+  - {dst: action_taken, src: ActionTaken, rule: copy}
+  - {dst: remarks,      src: Remarks,     rule: copy}
+  - {dst: updated_by,   src: UpdatedBy,   rule: copy}
+  - {dst: updated_at,   src: UpdatedTS,   rule: copy}
+
+# Target columns not written by this file
+defaults:
+  id: sequence shift_down_time_details_id_seq        # generated by the target
+
+# Source columns with no target
+unmapped_source:
+  - ID    # bigint NN - the target generates its own id
+
+open_questions:
+  - "down_category: the live aggregation takes it from the master (down_category.category_name through down_code_information), so it differs from the source text: source 'Operator' vs live 'operator' (and 'Quality'/'Maintenance' are the same), and McTI is 'Operator' in the source but 'supervisor' in the live table. This mapping copies the SOURCE text. To match the live value the pipeline needs a two-step lookup (down code -> category id -> category name); decide whether that is wanted."
+  - "threshold: the live value is the master's threshold (for example 3600 for no_data, 443 or 600 for Inspection), the source holds the value stored at the time (0 for NO_DATA, 180 for Inspection). This mapping copies the SOURCE value."
+  - "The live aggregation splits and recalculates some down rows (for example a row ending 14:47:53 in the source ends 14:47:32 in the target), and the live target has down rows the source does not have. This mapping copies the SOURCE rows."
+  - "The live target already holds rows written by its own aggregation service. A window load deletes the target rows of its date range first, so a run against that target would delete live rows. Run it against an empty target only."
+  - "Rows whose machine cannot be found in the master tables are listed as exceptions (machine_iot_id is NOT NULL). An unmatched plant, group, component, operation, operator or down code becomes NULL (the live code stores 0 / the default operator instead)."
+
+checks:
+  - "machine_iot_id is resolved for every row"          # NOT NULL in the target
+  - "the dimension key is unique"                       # unique index in the target; 193 of 193 on TPM_PGSQL
+  - "rows read = rows loaded + exceptions"

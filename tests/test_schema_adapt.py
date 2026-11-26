@@ -54,3 +54,27 @@ def test_list_source_columns_handles_errors():
         def cursor(self):
             raise RuntimeError("no")
     assert list_source_columns(Bad(), table()) is None
+
+
+def test_the_columns_of_a_joined_parent_table_are_listed_as_p_dot_column():
+    class Cur:
+        def __init__(self): self.table = None
+        def execute(self, sql, params): self.table = params[1]
+        def fetchall(self):
+            return [("Slno",), ("ID",)] if self.table == "ShiftRejectionDetails" else [("pDate",), ("Shift",)]
+
+    class Conn:
+        def cursor(self): return Cur()
+
+    m = TableMapping("t", "ShiftRejectionDetails", "t", [], [], {}, [],
+                     {"source": {"schema": "dbo", "join": {"table": "ShiftProductionDetails", "match": {"ID": "ID"}}}})
+    names = list_source_columns(Conn(), m)
+    assert names == {"slno", "id", "p.pdate", "p.shift"}
+
+
+def test_a_mapping_with_joined_columns_is_not_blocked_when_the_parent_has_them():
+    cols = [ColumnRule("production_date", "p.pDate", "copy")]
+    m = TableMapping("t", "T", "t", [], cols, {}, [], {"source": {"schema": "dbo"}})
+    tgt = {"production_date": TargetColumn("production_date", "timestamp", False)}
+    _, a = adapt_to_source(m, {"slno", "p.pdate"}, tgt)
+    assert a.blockers == []

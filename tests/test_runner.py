@@ -16,6 +16,7 @@ from unittest import mock
 import polars as pl
 
 from pipeline import maxtime as mt
+from pipeline import down_aggregate as da
 from pipeline import batching
 from pipeline import extract as ex
 from pipeline import load as ld
@@ -99,12 +100,13 @@ class Harness:
         self.fail_references = fail_references
         self.icd_cycle_calls, self.logical_calls = [], []
         self.maxtime_frames = []
+        self.down_loads = []
         self.target_has_window = True       # does the target still hold rows of a window the history calls completed?
         self.tgt = FakeTgt()
         self.cache = mock.MagicMock()
 
     # ---- fakes
-    def extract_batches(self, conn, m, where=None, params=(), batch_size=0, icd_lookback_seconds=None, prod_icd_cycles=None):
+    def extract_batches(self, conn, m, where=None, params=(), batch_size=0, icd_lookback_seconds=None, prod_icd_cycles=None, down=None):
         def gen():
             yield pl.DataFrame({"x": [1, 2]})
         return gen()
@@ -160,6 +162,10 @@ class Harness:
         self.logical_calls.append((low, high, start, end, months))
         return ex.generate_windows(JAN1, datetime(2026, 1, 20), 15, include_null_window=include_null_window)
 
+    def down_load(self, conn, config, start, end):
+        self.down_loads.append((config["source_table"], start, end))
+        return da.DownAggregate.empty(config)
+
     def maxtime_write(self, tracker_self, conn):
         self.maxtime_frames.append(tracker_self.frame.clone() if tracker_self.frame is not None else None)
         return 0 if tracker_self.frame is None else tracker_self.frame.height
@@ -185,6 +191,7 @@ class Harness:
             stack.enter_context(mock.patch.object(ld, "load_window", self.load_window))
             stack.enter_context(mock.patch.object(ld, "assert_target_empty", self.assert_target_empty))
             stack.enter_context(mock.patch.object(ld, "window_has_rows", self.window_has_rows))
+            stack.enter_context(mock.patch.object(da.DownAggregate, "load", self.down_load))
             stack.enter_context(mock.patch.object(mt.MaxTimeTracker, "seed_from_target", lambda *a, **k: 0))
             stack.enter_context(mock.patch.object(mt.MaxTimeTracker, "write", lambda tr, conn: self.maxtime_write(tr, conn)))
             stack.enter_context(mock.patch.object(tracking, "write_table_result", self.write_table_result))
@@ -449,3 +456,13 @@ def test_autodata_maxtime_is_written_once_at_the_end_with_the_latest_row_of_each
     assert len(h.maxtime_frames) == 1                                  # one write, after all windows
     got = {r["machine_iot_id"]: r["nd_time"] for r in h.maxtime_frames[0].iter_rows(named=True)}
     assert got == {1: t(6), 2: t(9)}
+
+
+def test_the_down_rows_of_each_window_are_read_for_the_production_summary():
+    h = Harness()
+    h.run(["shift_production_down_details"],
+          tracker=RecordingTracker(completed={"plant_information", "plant_groups", "machine_information", "component_information",
+                                              COP, "employee_information", "shift_details"}),
+          max_windows=2)
+    assert len(h.down_loads) == len(h.windows_loaded) >= 1
+    assert {name for name, _, _ in h.down_loads} == {"ShiftDownTimeDetails"}

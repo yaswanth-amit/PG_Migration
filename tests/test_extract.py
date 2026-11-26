@@ -8,6 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))      # the project 
 from datetime import datetime, timedelta
 
 from pipeline.mapping_config import load_mappings
+import polars as pl
+from pipeline.down_aggregate import DOWN_COLUMNS
 from pipeline import extract
 MS = load_mappings()
 T = MS.tables
@@ -115,10 +117,20 @@ def test_a_table_with_is_icd_needs_the_candidate_cycles():
         raise AssertionError("is_icd without candidate cycles must be refused")
 
 
-def test_masters_have_no_derived_columns():
+def test_only_autodata_and_the_shift_production_table_have_derived_columns():
     for name, m in T.items():
-        if name != "autodata":
+        if name not in ("autodata", "shift_production_down_details"):
             assert extract.derived_columns(m) == [], name
+    assert extract.derived_columns(T["shift_production_down_details"]) == ["cn"] + DOWN_COLUMNS
+
+
+def test_the_down_columns_need_the_down_rows_of_the_window():
+    try:
+        next(extract.extract_batches(None, T["shift_production_down_details"]))
+    except ValueError as e:
+        assert "down_aggregate" in str(e)
+    else:
+        raise AssertionError("the down columns without down rows must be refused")
 
 
 if __name__ == "__main__":
@@ -133,3 +145,44 @@ if __name__ == "__main__":
             print(f"  FAIL  {name}: {type(e).__name__}: {e}")
     print(f"\n{len(tests) - failed} passed, {failed} failed")
     raise SystemExit(1 if failed else 0)
+
+
+def test_add_cn_is_quantity_times_standard_times_over_sub_operation():
+    df = pl.DataFrame({"Prod_Qty": [12.0, 117.0, 10.0, None, 4.0],
+                       "CO_StdMachiningTime": [60.0, 180.0, 60.0, 60.0, 60.0],
+                       "CO_StdLoadUnload": [30.0, 30.0, 30.0, 30.0, None],
+                       "SubOperation": [1, 1, 2, 1, 1]})
+    assert extract.add_cn(df)["cn"].to_list() == [1080.0, 24570.0, 450.0, None, None]
+
+
+def test_add_cn_treats_null_or_zero_sub_operation_as_one():
+    df = pl.DataFrame({"Prod_Qty": [2.0, 2.0], "CO_StdMachiningTime": [10.0, 10.0],
+                       "CO_StdLoadUnload": [5.0, 5.0], "SubOperation": [None, 0]})
+    assert extract.add_cn(df)["cn"].to_list() == [30.0, 30.0]
+
+
+def test_add_cn_needs_its_source_columns():
+    try:
+        extract.add_cn(pl.DataFrame({"Prod_Qty": [1.0]}))
+    except ValueError as e:
+        assert "SubOperation" in str(e)
+    else:
+        raise AssertionError("missing source columns must be refused")
+
+
+def test_a_child_table_is_read_with_a_left_join_to_its_parent():
+    for name, child in (("shift_rejection_details", "ShiftRejectionDetails"), ("shift_rework_details", "ShiftReworkDetails")):
+        sql = extract.build_select_sql(T[name])
+        assert f"FROM [dbo].[{child}] AS a LEFT JOIN [dbo].[ShiftProductionDetails] AS p ON a.[ID] = p.[ID]" in sql
+        assert "p.[pDate] AS [p.pDate]" in sql and "a.[Slno]" in sql          # parent columns are aliased, child columns qualified
+        assert sql.endswith("ORDER BY a.[Slno]")
+
+
+def test_the_window_condition_of_a_joined_table_uses_the_parent_column():
+    assert extract.window_condition("p.pDate", datetime(2026, 1, 1), datetime(2026, 2, 1))[0] == "p.[pDate] >= ? AND p.[pDate] < ?"
+    assert extract.window_condition("p.pDate", None, None)[0] == "p.[pDate] IS NULL"
+
+
+def test_a_table_without_a_join_is_read_as_before():
+    sql = extract.build_select_sql(T["plant_information"])
+    assert " AS a" in sql and "LEFT JOIN" not in sql and "a.[" not in sql

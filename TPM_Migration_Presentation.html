@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TPM Migration: SQL Server to PostgreSQL</title>
+<style>
+  :root{
+    --bg:#0e131b; --card:#18202c; --ink:#e7ecf3; --muted:#9aa7b8; --line:#2c3748;
+    --accent:#6ea8ff; --accent-soft:#16294a; --good:#4cc77a; --good-soft:#12301f;
+    --warn:#f0a24b; --warn-soft:#3a2810; --bad:#ff7b72; --bad-soft:#3d1a18; --code:#1d2736;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:radial-gradient(1200px 700px at 70% -10%,#17233a 0%,var(--bg) 60%) fixed;color:var(--ink);
+    font:18px/1.6 "Segoe UI",system-ui,sans-serif}
+  .deck{max-width:1060px;margin:0 auto;padding:30px 24px 90px}
+  section.slide{padding:44px 0 36px;border-bottom:1px solid var(--line);scroll-margin-top:20px}
+  section.slide:last-child{border-bottom:0}
+  .tag{font-size:13px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);font-weight:600;margin-bottom:6px}
+  h1{font-size:46px;line-height:1.15;margin:0 0 14px}
+  h2{font-size:32px;line-height:1.2;margin:0 0 16px}
+  h3{font-size:19px;margin:18px 0 8px;color:#fff}
+  p{margin:0 0 12px} .lead{font-size:21px;color:var(--muted)}
+  ul,ol{margin:0 0 12px;padding-left:22px} li{margin:5px 0}
+  code{background:var(--code);padding:1px 6px;border-radius:4px;font:14px Consolas,monospace;color:#cfe0ff}
+  pre{background:var(--code);padding:14px 16px;border-radius:8px;overflow:auto;font:14px/1.5 Consolas,monospace;margin:8px 0 14px;color:#cfe0ff}
+  table{border-collapse:collapse;width:100%;margin:8px 0 14px;font-size:15.5px;background:var(--card)}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--accent-soft)}
+  .note{background:var(--warn-soft);border-left:4px solid var(--warn);padding:10px 14px;border-radius:4px;margin:12px 0}
+  .key{background:var(--accent-soft);border-left:4px solid var(--accent);padding:10px 14px;border-radius:4px;margin:12px 0}
+  .ok{background:var(--good-soft);border-left:4px solid var(--good);padding:10px 14px;border-radius:4px;margin:12px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr} h1{font-size:34px} h2{font-size:26px}}
+  .flow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:16px 0}
+  .box{background:var(--card);border:2px solid var(--accent);border-radius:10px;padding:10px 14px;text-align:center;font-size:15px}
+  .box small{display:block;color:var(--muted);font-size:13px}
+  .box.db{border-radius:22px;background:var(--accent-soft)}
+  .box.g{border-color:var(--good);background:var(--good-soft)}
+  .box.w{border-color:var(--warn);background:var(--warn-soft)}
+  .box.r{border-color:var(--bad);background:var(--bad-soft)}
+  .arrow{font-size:22px;color:var(--muted);text-align:center}
+  .arrow small{display:block;font-size:12px;color:var(--muted)}
+  .stack{display:flex;flex-direction:column;align-items:center;gap:8px}
+  .row2{display:flex;gap:14px;justify-content:center;align-items:stretch;flex-wrap:wrap}
+  .row2>.box{flex:1 1 300px}
+  .timeline{font:14px/1.5 Consolas,monospace;background:var(--code);padding:14px 16px;border-radius:8px;overflow:auto;white-space:pre;color:#cfe0ff}
+  .top{position:fixed;right:16px;bottom:16px;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:6px 12px;font-size:15px;cursor:pointer;opacity:0;pointer-events:none;transition:opacity .3s}
+  .top.show{opacity:1;pointer-events:auto}
+  .top:hover{background:var(--accent-soft)}
+  .progress{position:fixed;left:0;top:0;height:3px;width:0;background:var(--accent);z-index:6}
+</style>
+</head>
+<body>
+
+<div class="progress" id="progress"></div>
+<div class="deck">
+<!-- 1. Title -->
+<section class="slide">
+  <div class="tag">Raw OEE &middot; Data migration</div>
+  <h1>TPM migration:<br>SQL Server to PostgreSQL</h1>
+  <p class="lead">A pipeline that copies 25 <code>master_data</code> tables and <code>production_core.autodata</code> from
+  SQL Server (<code>TPM_PGSQL</code>) to PostgreSQL, one YAML mapping per table.</p>
+  <ul>
+    <li>Plain copy with column mapping and lookups. No business changes.</li>
+    <li>Extract, transform in Polars, load with <code>COPY</code>.</li>
+    <li>Rehearsal by default: everything runs, then rolls back.</li>
+  </ul>
+  <div class="note">Anything that changes a production system needs testing and your normal change-control review first.
+  Always run a rehearsal before a real migration.</div>
+  <p style="color:var(--muted);font-size:14px">Scroll down to read. The page is one continuous document.</p>
+</section>
+
+<!-- 2. Pipeline -->
+<section class="slide">
+  <div class="tag">1 &middot; Overview</div>
+  <h2>The pipeline in one picture</h2>
+  <div class="flow">
+    <div class="box db">SQL Server</div>
+    <div class="arrow">&rarr;<small>1 EXTRACT<br>read rows in chunks</small></div>
+    <div class="box">DataFrame<small>source columns</small></div>
+    <div class="arrow">&rarr;<small>2 TRANSFORM<br>map, look up, check</small></div>
+    <div class="box g">DataFrame<small>target columns</small></div>
+    <div class="arrow">&rarr;<small>3 LOAD<br>COPY in a transaction</small></div>
+    <div class="box db">PostgreSQL</div>
+  </div>
+  <div class="row2">
+    <div class="box r">Bad rows<small>go to an exceptions file, with a reason</small></div>
+    <div class="box">Counts, logs, progress<small>go to <code>migration.*</code> tables</small></div>
+  </div>
+  <ul style="margin-top:18px">
+    <li>Every table goes through the same three steps. Tables run in dependency order (parents before children).</li>
+    <li>A <b>rehearsal</b> does everything inside one transaction and rolls it back. A <b>real</b> run keeps the data.</li>
+  </ul>
+</section>
+
+<!-- 3. Extract -->
+<section class="slide">
+  <div class="tag">2 &middot; Extract</div>
+  <h2>Read in chunks, in windows</h2>
+  <p>Rows are read in chunks of <b>50,000</b> into a DataFrame. Only the columns the mapping uses are read.
+  Small tables are read in one go. The big table, <code>autodata</code>, is read in <b>windows of one logical month</b>.</p>
+  <div class="grid2">
+    <div>
+      <h3>Terms</h3>
+      <ul>
+        <li><b>Window</b>: one time range of <code>autodata</code>, loaded in one transaction.</li>
+        <li><b>Chunk</b>: the next 50,000 rows read from inside a window.</li>
+        <li><b>Logical day</b>: starts when the first shift starts (for example 06:00), from <code>utility.get_logical_day</code>.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Windows</h3>
+<pre>window 1: 2026-10-01 06:00 -> 2026-11-01 06:00
+window 2: 2026-11-01 06:00 -> 2026-12-01 06:00
+each window starts where the last one ended</pre>
+      <p style="font-size:15px">Fixed windows of N days are also possible (<code>--days N</code>).</p>
+    </div>
+  </div>
+  <div class="key">A row belongs to the window that contains its start time (<code>sttime</code>). No gaps, no overlaps.
+  Rows with <code>sttime</code> NULL get one extra window, so no row is lost. The run stops if the windows miss any row.</div>
+</section>
+
+<!-- 4. Transform -->
+<section class="slide">
+  <div class="tag">3 &middot; Transform</div>
+  <h2>Rules from the YAML file</h2>
+  <p>Each DataFrame goes through the rules of its YAML mapping: <code>copy</code>, <code>cast</code>, <code>trim</code>,
+  <code>coalesce</code>, <code>map</code>, <code>lookup</code>, and so on.</p>
+  <div class="grid2">
+    <div>
+      <h3>Lookup</h3>
+      <p>A business id from the source (for example a machine code) is replaced by the target's <code>iot_id</code>,
+      using the parent table already loaded in PostgreSQL.</p>
+    </div>
+    <div>
+      <h3>Checks</h3>
+      <ul>
+        <li>The value fits the target type.</li>
+        <li>NOT NULL columns have a value.</li>
+        <li>No duplicate key.</li>
+        <li>The parent was found.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="ok">A row that fails a check is <b>not dropped silently</b>. It goes to <code>reports/&lt;table&gt;_exceptions.csv</code> with a reason.
+  After every table: <b>rows read = rows loaded + rows in the exceptions file</b>, or the run stops.</div>
+</section>
+
+<!-- 5. is_icd rule -->
+<section class="slide">
+  <div class="tag">3 &middot; Transform</div>
+  <h2>How <code>is_icd</code> is solved for autodata</h2>
+  <p><code>autodata</code> has two kinds of rows: <b>cycles</b> (<code>datatype = 1</code>, a part being machined) and
+  <b>downtimes</b> (<code>datatype = 2</code>). A downtime is an <b>ICD</b> (in-cycle downtime) when it happens
+  <i>inside</i> a cycle that ran longer than its own <code>cycletime</code>.</p>
+  <div class="key"><b>Rule:</b> a downtime is ICD when a cycle of the <b>same machine</b>, with <code>duration &gt; cycletime</code>,
+  <b>starts before</b> the downtime starts and <b>ends after</b> the downtime ends.</div>
+  <p>SQL Server did this with a slow check per row. Here it is done in Polars with <b>two frames</b> per window.
+  <code>prod_icd_cycles</code> means <i>production cycles that can hold an ICD</i>.</p>
+  <table>
+    <tr><th>Frame</th><th>What it holds</th><th>How it is read</th><th>How often</th></tr>
+    <tr><td><b>Frame 1</b><br><code>prod_icd_cycles</code></td>
+        <td>Only candidate cycles: <code>datatype = 1</code> and <code>duration &gt; cycletime</code>. Columns <code>mc, sttime, ndtime</code>.
+        Includes cycles that started <i>before</i> the window start and run into it.</td>
+        <td><code>extract_batch_prod_icd_cycles(window_start, window_end)</code>, one query per machine, range <code>[window_start - lookback, window_end)</code></td>
+        <td><b>Once per window</b></td></tr>
+    <tr><td><b>Frame 2</b><br><code>df</code></td>
+        <td>The real rows to migrate (all datatypes): one chunk of up to 50,000 rows.</td>
+        <td><code>extract_batches</code>: <code>SELECT ... WHERE sttime in the window</code>, <code>fetchmany(50000)</code></td>
+        <td><b>Repeated</b> until the window is done</td></tr>
+  </table>
+  <p style="font-size:15px"><code>lookback</code> is the longest cycle that qualifies (measured once per run). No cycle that contains a downtime
+  can start earlier than <code>window_start - lookback</code>, so Frame 1 stays small but is still exact.</p>
+</section>
+
+<!-- 6. is_icd diagram -->
+<section class="slide">
+  <div class="tag">3 &middot; Transform</div>
+  <h2><code>is_icd</code>: two frames, one result</h2>
+  <div class="stack">
+    <div class="box">One window<small>window_start .. window_end</small></div>
+    <div class="arrow">&darr;</div>
+    <div class="row2" style="width:100%">
+      <div class="box w"><b>FRAME 1: prod_icd_cycles</b><small>only cycles with duration &gt; cycletime, incl. cycles that began before window_start<br><b>read ONCE per window</b></small></div>
+      <div class="box g"><b>FRAME 2: df</b><small>SELECT ... WHERE sttime in the window<br>next 50,000 rows, all datatypes<br><b>read again for every chunk</b></small></div>
+    </div>
+    <div class="arrow">&darr;</div>
+    <div class="box"><code>add_is_icd(df, prod_icd_cycles)</code></div>
+    <div class="arrow">&darr;</div>
+    <div class="box">Downtime row (datatype = 2) inside a Frame 1 cycle of the same machine?</div>
+    <div class="row2" style="width:100%">
+      <div class="box g">yes: <code>is_icd = 1</code></div>
+      <div class="box">no, or a cycle row (not tested): <code>is_icd = 0</code></div>
+    </div>
+    <div class="arrow">&darr;</div>
+    <div class="box g">Returns Frame 2 with the new column <code>is_icd</code> (same rows, same order), then transform and load.<small>Next 50,000 rows: back to Frame 2. Frame 1 is reused.</small></div>
+  </div>
+  <div class="key" style="margin-top:16px"><code>add_is_icd</code> takes both frames but <b>returns Frame 2</b>. Frame 1 is never changed and never loaded.
+  Only downtime rows are tested.</div>
+</section>
+
+<!-- 7. Worked example -->
+<section class="slide">
+  <div class="tag">3 &middot; Transform</div>
+  <h2>Worked example</h2>
+  <p>Window 2 starts at 06:00. One cycle began before 06:00 and is still running, so it belongs to window 1 but is needed here. Machine M1:</p>
+<div class="timeline"> 06:00 window_start
+   |
+ 00:00 ================== 07:00     cycle C1  (cycletime 1 h, ran 7 h)   &lt;- belongs to window 1
+   |     06:45-06:50                downtime D1
+   |        06:55-06:58             downtime D2
+   |                07:01-07:04     normal cycle N1
+   |                         09:00-09:20  downtime D3
+   |                                10:00 ======== 10:30   cycle C2 (cycletime 10 min, ran 30 min)
+   |                                           10:10-10:15  downtime D4</div>
+  <div class="grid2">
+    <table>
+      <tr><th>Frame</th><th>Rows</th></tr>
+      <tr><td><b>Frame 1</b></td><td>C1, C2. C1 is <i>borrowed</i> from window 1: used only to check, never loaded again.</td></tr>
+      <tr><td><b>Frame 2</b></td><td>D1, D2, N1, D3, C2, D4: the rows that are loaded.</td></tr>
+    </table>
+    <table>
+      <tr><th>Row</th><th>Inside a Frame 1 cycle?</th><th>is_icd</th></tr>
+      <tr><td>D1 06:45-06:50</td><td>yes, C1</td><td><b>1</b></td></tr>
+      <tr><td>D2 06:55-06:58</td><td>yes, C1</td><td><b>1</b></td></tr>
+      <tr><td>N1 (cycle)</td><td>not tested</td><td>0</td></tr>
+      <tr><td>D3 09:00-09:20</td><td>no</td><td>0</td></tr>
+      <tr><td>C2 (cycle)</td><td>not tested</td><td>0</td></tr>
+      <tr><td>D4 10:10-10:15</td><td>yes, C2</td><td><b>1</b></td></tr>
+    </table>
+  </div>
+  <div class="ok">Without C1, D1 and D2 would look like ordinary downtimes. The result equals the original SQL rule: checked on real data
+  with windows of 7 minutes, 1 hour and 6 hours, with the same flags, none missing, none extra.</div>
+</section>
+
+<!-- 11. Polars short answer -->
+<section class="slide">
+  <div class="tag">3 &middot; Transform &middot; Why Polars</div>
+  <h2>Why the transform step is fast</h2>
+  <div class="key">The old way did the work <b>one row at a time</b>. Polars does it <b>one column at a time, for thousands of rows at once</b>,
+  in memory, on several CPU cores, in compiled code.</div>
+  <table>
+    <tr><th></th><th>Row by row (old SQL check, Python loop)</th><th>Polars (this pipeline)</th></tr>
+    <tr><td>Unit of work</td><td>1 row</td><td>a whole column of a chunk (up to 50,000 rows)</td></tr>
+    <tr><td>Where it runs</td><td>the database engine, or the Python interpreter</td><td>compiled Rust code, no Python in the inner loop</td></tr>
+    <tr><td>Data layout</td><td>row by row</td><td>column by column (columnar)</td></tr>
+    <tr><td>Cores used</td><td>usually 1</td><td>all available</td></tr>
+    <tr><td>Repeated work</td><td>the check runs again for every row</td><td>joins and group-bys build a lookup structure once</td></tr>
+  </table>
+</section>
+
+<!-- 12. Where Polars used -->
+<section class="slide">
+  <div class="tag">3 &middot; Transform &middot; Why Polars</div>
+  <h2>Where Polars is used</h2>
+  <div class="flow">
+    <div class="box db">SQL Server</div>
+    <div class="arrow">&rarr;<small>EXTRACT<br>pyodbc fetchmany(50,000)<br>row-based</small></div>
+    <div class="box g">Polars DataFrame<small>one chunk, in memory</small></div>
+    <div class="arrow">&rarr;<small>TRANSFORM<br>expressions, joins<br><b>VECTORIZED</b></small></div>
+    <div class="box g">Polars DataFrame<small>target columns</small></div>
+    <div class="arrow">&rarr;<small>LOAD<br>psycopg COPY<br>row-based</small></div>
+    <div class="box db">PostgreSQL</div>
+  </div>
+  <p>The green boxes are where Polars does the work. The two arrows into and out of the database are <b>not</b> Polars:
+  the database driver hands rows over, and they are copied out again.</p>
+</section>
+
+<!-- 13. Vectorized -->
+<section class="slide">
+  <div class="tag">3 &middot; Transform &middot; Why Polars</div>
+  <h2>Idea 1: vectorized execution</h2>
+  <p><b>Vectorized</b> means one operation is applied to a <i>whole column</i> in one call, not to one value per call.</p>
+  <div class="grid2">
+    <div>
+      <h3>Row by row (we do not do this)</h3>
+<pre>for row in rows:           # 50,000 times
+    if row["mc"].lower().strip() == ...:
+        ...</pre>
+    </div>
+    <div>
+      <h3>Polars expression (the pipeline)</h3>
+<pre>key = pl.col("mc").str.to_lowercase().str.strip_chars_end()
+batch.with_columns(key.alias("_mc"))   # all rows, one call</pre>
+    </div>
+  </div>
+  <ul>
+    <li><b>No interpreter overhead per row.</b> A Python loop pays a cost on every iteration. Polars pays it once per column, then runs a compiled loop.</li>
+    <li><b>CPU-friendly.</b> The loop runs over a plain array of numbers, so the CPU can use SIMD (one instruction on several values) and keep data in its fast cache.</li>
+  </ul>
+</section>
+
+<!-- 14. Columnar -->
+<section class="slide">
+  <div class="tag">3 &middot; Transform &middot; Why Polars</div>
+  <h2>Idea 2: columnar, in-memory data</h2>
+  <p>Polars stores data <b>by column</b> (the Apache Arrow layout), not by row.</p>
+<pre>Row layout:     [mc, sttime, ndtime] [mc, sttime, ndtime] [mc, sttime, ndtime] ...
+Column layout:  mc:     [M1, M1, M2, ...]
+                sttime: [06:00, 06:10, 06:12, ...]     &lt;- one filter reads only this block
+                ndtime: [06:05, 06:12, 06:30, ...]</pre>
+  <ul>
+    <li>A rule like <code>sttime &lt; ndtime</code> reads <b>only the two columns it needs</b>.</li>
+    <li>Values of one type sit next to each other, so memory is read in long straight runs.</li>
+    <li>Each chunk is held <b>in memory</b> while transformed. No temporary table, no file on disk. <code>extract</code> asks SQL Server only for the columns the mapping uses.</li>
+  </ul>
+  <div class="ok"><b>Memory stays bounded.</b> The pipeline never loads the whole 900,000-row table. It reads 50,000 rows at a time, transforms, loads, moves on.
+  Only the window's cycle frame (<code>prod_icd_cycles</code>, three columns) is kept for the whole window.</div>
+</section>
+
+<!-- 15. Cores + joins -->
+<section class="slide">
+  <div class="tag">3 &middot; Transform &middot; Why Polars</div>
+  <h2>Ideas 3 and 4: many cores, and joins instead of lookups</h2>
+  <div class="grid2">
+    <div>
+      <h3>Many cores, no Python lock</h3>
+      <p>Python runs one thread at a time (the GIL). Polars runs in Rust and releases that lock, so one join or <code>group_by</code> can use all cores.
+      No threading code is needed.</p>
+    </div>
+    <div>
+      <h3>Lookups as one join</h3>
+      <p><b>Row by row:</b> one database query per row = 900,000 round trips.<br>
+      <b>Here:</b> each master table is read <b>once per run</b>, then <b>joined</b> to every chunk. The join builds a hash table of the small side once.</p>
+    </div>
+  </div>
+  <div class="flow">
+    <div class="box db"><code>machine_information</code><small>read ONCE per run</small></div>
+    <div class="arrow">&rarr;</div>
+    <div class="box">hash table<small>interface_id &rarr; iot_id</small></div>
+    <div class="arrow">&larr;</div>
+    <div class="box">chunk of 50,000 rows<small>join</small></div>
+    <div class="arrow">&rarr;</div>
+    <div class="box g">chunk with <code>machine_iot_id</code></div>
+  </div>
+  <h3><code>is_icd</code> as a set operation</h3>
+  <p>The old SQL ran an <code>EXISTS</code> sub-query for every downtime row (minutes per window). <code>add_is_icd</code> instead:</p>
+  <ol>
+    <li>splits downtime rows and cycles <b>by machine</b> (<code>partition_by</code>);</li>
+    <li>joins them with the range conditions (<code>join_where</code>: cycle starts before, ends after);</li>
+    <li>marks all matches in <b>one</b> <code>is_in</code> operation (a hash-set test).</li>
+  </ol>
+  <p style="font-size:15px">It also does less work: cycles are first filtered to the time range of the chunk's downtimes, and Frame 1 only holds cycles that can contain a downtime at all.</p>
+</section>
+
+<!-- 16. Honest limits -->
+<section class="slide">
+  <div class="tag">3 &middot; Transform &middot; Why Polars</div>
+  <h2>The honest part: what Polars does not speed up</h2>
+  <table>
+    <tr><th>Step</th><th>Mostly limited by</th><th>Is it Polars?</th></tr>
+    <tr><td>Extract</td><td>network and SQL Server returning rows through ODBC (<code>pyodbc</code>, row tuples converted to a DataFrame)</td><td>No</td></tr>
+    <tr><td><b>Transform</b></td><td>CPU and memory</td><td><b>Yes, vectorized</b></td></tr>
+    <tr><td>Load</td><td>PostgreSQL <code>COPY</code> fed from Python (writes rows one by one into the COPY stream)</td><td>No</td></tr>
+  </table>
+  <ul>
+    <li>Polars removes the slow, CPU-heavy middle: casts, trims, lookups, duplicate checks and <code>is_icd</code>.</li>
+    <li>The first full real run read and loaded <b>913,753 autodata rows in about 2.5 minutes</b> end to end (4 windows). This is a whole-pipeline number, <b>not</b> "Polars speed".</li>
+    <li>To go faster still, look at the database read and the <code>COPY</code> loop, not the transform.</li>
+    <li>The pipeline uses <b>eager</b> DataFrames on 50,000-row chunks because data arrives from a database cursor, not from a file. Lazy mode helps mostly for large file scans.</li>
+  </ul>
+</section>
+
+<!-- 8. Load -->
+<section class="slide">
+  <div class="tag">4 &middot; Load</div>
+  <h2>Complete or not at all</h2>
+  <div class="grid2">
+    <div class="box" style="text-align:left">
+      <b>Normal table: one transaction</b>
+      <ol style="margin:8px 0 0;padding-left:20px"><li>target must be empty</li><li>COPY all chunks</li><li>record the result</li><li><b>COMMIT</b></li></ol>
+    </div>
+    <div class="box" style="text-align:left">
+      <b>autodata: one transaction per window</b>
+      <ol style="margin:8px 0 0;padding-left:20px"><li>delete this window's rows</li><li>COPY the window</li><li>record the window</li><li><b>COMMIT</b></li></ol>
+    </div>
+  </div>
+  <ul style="margin-top:18px">
+    <li>A table or window is stored <b>completely or not at all</b>. Its result is recorded in the same commit, so the history can never say "done" for rows that were rolled back.</li>
+    <li>Deleting a window first makes it <b>safe to repeat</b>. Resume skips windows finished earlier, but only if their rows are still in the target.</li>
+    <li>If a table fails, tables that depend on it are skipped. The others continue.</li>
+    <li>Counts, times and errors go to <code>migration.*</code>, logs and <code>logs/progress_*.json</code>. Never row values.</li>
+  </ul>
+</section>
+
+<!-- 9. maxtime -->
+<section class="slide">
+  <div class="tag">4 &middot; Load</div>
+  <h2><code>autodata_maxtime</code>: one global frame</h2>
+  <p><code>production_core.autodata_maxtime</code> holds the latest row of each machine. It is <b>not read from SQL Server</b>.
+  While <code>autodata</code> loads, one global DataFrame (<code>pipeline/maxtime.py</code>) keeps one row per machine.</p>
+  <div class="flow">
+    <div class="box">Each chunk<small>going to the load</small></div>
+    <div class="arrow">&rarr;<small>update</small></div>
+    <div class="box g">Global frame<small>1 row per machine (~158 rows)</small></div>
+    <div class="arrow">&rarr;<small>after the last window</small></div>
+    <div class="box db"><code>autodata_maxtime</code></div>
+  </div>
+  <ol>
+    <li>Only <code>datatype</code> 1 and 2 count. The latest <code>nd_time</code> wins (tie: later <code>st_time</code>).</li>
+    <li>After the <b>last window</b>, the frame is inserted: one row per machine.</li>
+    <li>A machine already in the table is replaced only when the new <code>nd_time</code> is not older, so a newer live row is never overwritten.</li>
+    <li>On a resumed run the skipped windows are not seen, so the frame is first filled from the <code>autodata</code> rows already in the target.</li>
+  </ol>
+  <p style="font-size:15px">In a rehearsal the insert is rolled back with everything else. The extra work is almost free and needs no extra read.</p>
+</section>
+
+</div>
+<button class="top" id="top" aria-label="Back to top">&uarr; Top</button>
+<script>
+(function(){
+  var top=document.getElementById('top'),pr=document.getElementById('progress');
+  function upd(){
+    var h=document.documentElement,m=h.scrollHeight-h.clientHeight;
+    pr.style.width=(m>0?window.scrollY/m*100:0)+'%';
+    top.classList.toggle('show',window.scrollY>600);
+  }
+  top.onclick=function(){window.scrollTo({top:0,behavior:'smooth'})};
+  window.addEventListener('scroll',upd,{passive:true});upd();
+})();
+</script>
+</body>
+</html>

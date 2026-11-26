@@ -73,7 +73,7 @@ def test_list_shows_every_table_in_load_order():
     code, text = run_cli(["list"])
     assert code == EXIT_OK
     lines = [l for l in text.splitlines()[1:] if l.strip()]
-    assert len(lines) == 26 and lines[-1].split()[1] == "autodata"
+    assert len(lines) == 30 and lines[-1].split()[1] == "shift_rework_details"
     assert any("component_operation_pricing" in l and "machine_information" in l for l in lines)
 
 
@@ -86,9 +86,9 @@ def test_plan_refuses_cop_without_its_parents_and_accepts_it_when_they_are_migra
     assert code == EXIT_OK and "component_operation_pricing" in text
 
 
-def test_plan_all_lists_26_tables_in_order():
+def test_plan_all_lists_28_tables_in_order():
     code, text = run_cli(["plan"])
-    assert code == EXIT_OK and len(text.strip().splitlines()) == 26
+    assert code == EXIT_OK and len(text.strip().splitlines()) == 30
     assert text.index("customer_information") < text.index("component_information") < text.index("autodata")
 
 

@@ -4,7 +4,7 @@ Markdown treats a line indented by 4+ spaces as code, so every block here is bui
 """
 from html import escape
 
-from pipeline import services
+from ui import services
 
 CSS = """
 <style>

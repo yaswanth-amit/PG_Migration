@@ -16,8 +16,8 @@ os.environ["PG_MIGRATION_UI_OFFLINE"] = "1"                 # before anything re
 
 from streamlit.testing.v1 import AppTest
 
-from pipeline import services
-from pipeline import ui_components as ui
+from ui import components as ui_view
+from ui import services
 from pipeline.load import REPORT_DIR
 from pipeline.mapping_config import load_mappings
 
@@ -26,8 +26,12 @@ COP = "component_operation_pricing"
 APP = str(Path(__file__).resolve().parents[1] / "ui_app.py")
 
 
-def app():
-    return AppTest.from_file(APP, default_timeout=60).run()
+def app(dev=True):
+    """The page in developer mode (the full screen); app(dev=False) is the field screen."""
+    services.latest_progress_path = lambda: None            # the page tests must not read the real logs folder
+    at = AppTest.from_file(APP, default_timeout=60)
+    at.session_state["dev"] = dev
+    return at.run()
 
 
 def button(at, label):
@@ -103,8 +107,8 @@ def test_connection_info_has_no_secrets():
 def test_the_page_starts_without_errors_and_shows_every_table():
     at = app()
     assert not at.exception
-    assert len([c for c in at.checkbox if c.key and c.key.startswith("sel_")]) == 26
-    assert len(at.tabs) == 4
+    assert len([c for c in at.checkbox if c.key and c.key.startswith("sel_")]) == 30
+    assert len(at.tabs) == 5                                        # Database, Migrate, Live, Mapping, History
 
 
 def test_select_all_and_clear():
@@ -225,13 +229,13 @@ def test_progress_reporter_writes_stages_counts_and_survives_a_bad_path():
 
 def test_html_shows_rows_stages_and_escapes_names():
     snap = _snapshot()
-    html = ui.live_card(snap, services.summarize_progress(snap), 0.1)
+    html = ui_view.live_card(snap, services.summarize_progress(snap), 0.1)
     assert "190" in html and "Transform" in html and "Load" in html and "Migrating b" in html and "LIVE" in html
     assert "\n" not in html                                         # one line: markdown would show indented lines as code
     snap["tables"][0]["name"] = "<script>x</script>"
-    assert "<script>" not in ui.table_rows(snap)
+    assert "<script>" not in ui_view.table_rows(snap)
     done = dict(_snapshot("completed", "done"), finished_ts=1.0)
-    assert "Rehearsal complete" in ui.live_card(done, services.summarize_progress(done))
+    assert "Rehearsal complete" in ui_view.live_card(done, services.summarize_progress(done))
 
 
 def test_the_command_carries_the_progress_file():
@@ -265,7 +269,7 @@ def test_a_date_range_outside_the_data_is_detected():
 def test_a_windowed_table_that_read_nothing_gets_a_hint():
     snap = _snapshot("completed", "done")
     snap["tables"][0].update(name="autodata", rows_read=0, windows_total=2, windows_done=2)
-    assert "No rows were read" in ui.table_rows(snap)
+    assert "No rows were read" in ui_view.table_rows(snap)
 
 
 def test_a_dead_process_in_the_progress_file_means_the_run_is_not_active():

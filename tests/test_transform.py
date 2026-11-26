@@ -341,3 +341,47 @@ if __name__ == "__main__":
             print(f"  FAIL  {name}: {type(e).__name__}: {e}")
     print(f"\n{len(tests) - failed} passed, {failed} failed")
     raise SystemExit(1 if failed else 0)
+
+
+def test_null_as_false_turns_a_null_flag_into_false_also_after_a_lookup():
+    from pipeline.mapping_config import ColumnRule
+    from pipeline.transform import _apply_null_as, TransformContext
+    col = ColumnRule(dst="prod_effy", src="DownID", rule="lookup", params={"null_as": False})
+    ctx = TransformContext(load_time=datetime(2026, 1, 1), target_schema={})
+    got = pl.DataFrame({"x": [True, None, False]}).select(_apply_null_as(pl.col("x"), col, ctx))["x"].to_list()
+    assert got == [True, False, False]
+
+
+def test_the_two_down_flags_of_the_down_table_come_from_the_down_code_master():
+    from pipeline.mapping_config import load_mappings
+    m = load_mappings().tables["shift_down_time_details"]
+    rules = {c.dst: c for c in m.columns}
+    for dst, ret in (("prod_effy", "production_efficiency"), ("threshold_from_co", "threshold_from_co")):
+        assert rules[dst].rule == "lookup" and rules[dst].params["table"] == "down_code_information"
+        assert rules[dst].params["return"] == ret and rules[dst].params["null_as"] is False
+
+
+def test_shift_time_uses_the_source_value_else_the_shift_times_of_shift_details():
+    from datetime import datetime as dt
+    from pipeline.lookups import LookupUse
+    from pipeline.mapping_config import ColumnRule
+    from pipeline.transform import _rule_shift_time
+
+    frames = {
+        "from_time": pl.DataFrame({"shift_name": ["FIRST", "THIRD"], "from_time": [dt(1900, 1, 1, 6), dt(2023, 7, 27, 22)]}),
+        "to_time": pl.DataFrame({"shift_name": ["FIRST", "THIRD"], "to_time": [dt(1900, 1, 1, 14), dt(2023, 7, 27, 6)]}),
+        "to_day": pl.DataFrame({"shift_name": ["FIRST", "THIRD"], "to_day": [0, 1]}),
+    }
+
+    class Lk:
+        def get(self, use: LookupUse):
+            return frames[use.ret]
+
+    c = ctx({}, lookups=Lk())
+    df = pl.DataFrame({"S": [None, None, dt(2025, 1, 1, 7, 7), None], "pDate": [dt(2025, 3, 10)] * 4,
+                       "Shift": ["FIRST", "THIRD", "FIRST", "UNKNOWN"]})
+    start = _rule_shift_time(ColumnRule("a", "S", "shift_time", {"part": "start", "date": "pDate", "shift": "Shift"}), c, {})
+    end = _rule_shift_time(ColumnRule("b", "S", "shift_time", {"part": "end", "date": "pDate", "shift": "Shift"}), c, {})
+    got = df.select(start.alias("start"), end.alias("end"))
+    assert got["start"].to_list() == [dt(2025, 3, 10, 6), dt(2025, 3, 10, 22), dt(2025, 1, 1, 7, 7), None]
+    assert got["end"].to_list() == [dt(2025, 3, 10, 14), dt(2025, 3, 11, 6), dt(2025, 1, 1, 7, 7), None]

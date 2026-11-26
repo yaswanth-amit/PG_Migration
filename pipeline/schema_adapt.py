@@ -26,6 +26,11 @@ def list_source_columns(conn , m : TableMapping) -> set[str] | None:
         cur.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
                     (src.get("schema", "dbo"), m.src_table))
         names = {str(r[0]).lower() for r in cur.fetchall()}
+        join = src.get("join")
+        if names and join:                                  # the parent table's columns are named p.<column> in the mapping
+            cur.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                        (join.get("schema", src.get("schema", "dbo")), join["table"]))
+            names |= {f"p.{str(r[0]).lower()}" for r in cur.fetchall()}
         return names or None
     except Exception:                                       # noqa: BLE001 - unreadable = do not adapt
         return None

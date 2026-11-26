@@ -2,6 +2,7 @@ import polars as pl
 from datetime import datetime, timedelta
 from typing import Iterator, Sequence
 from pipeline.mapping_config import TableMapping
+from pipeline.down_aggregate import DOWN_COLUMNS, DownAggregate
 
 # DATEDIFF counts second boundaries crossed, so a cycle can be up to one second longer than the
 # value it returns. A small safety margin keeps the lookback below from ever excluding a real match.
@@ -42,6 +43,11 @@ def collect_source_columns(m : TableMapping) -> list[str]:
                     if isinstance(value, str) and not value.startswith("@"):
                         _add_column(value, columns, seen)
 
+        # shift_time reads its date and shift columns as well
+        if col.rule == "shift_time":
+            _add_column(col.params.get("date"), columns, seen)
+            _add_column(col.params.get("shift"), columns, seen)
+
         # when: {column: X, in: [...]} reads source column X
         when = col.params.get("when")
         if isinstance(when, dict):
@@ -58,6 +64,10 @@ def collect_source_columns(m : TableMapping) -> list[str]:
 
 
 def quote_ident(name : str) -> str:
+    """[name]. A name with an alias in front ('p.pDate', a column of the joined parent table) becomes p.[pDate]."""
+    alias, dot, column = name.partition(".")
+    if dot and alias.isidentifier():
+        return f"{alias}.[{column.replace(']', ']]')}]"
     clean = name.replace("]", "]]")
     return f"[{clean}]"
 
@@ -71,6 +81,30 @@ def _source_table_sql(m : TableMapping) -> str:
     return f"{quote_ident(schema)}.{quote_ident(table)}"
 
 
+def _join_sql(m : TableMapping) -> str:
+    """The optional parent join of a source table (mapping key source.join), for a child table that holds only the
+    parent's ID (for example ShiftRejectionDetails -> ShiftProductionDetails). The child is alias a, the parent p; a
+    parent column is named 'p.<column>' everywhere in the mapping. LEFT JOIN: a child row without a parent is still read
+    (its parent columns are NULL) and ends up in the exceptions report, never silently lost."""
+    join = (m.raw.get("source") or {}).get("join")
+    if not join:
+        return ""
+    schema = join.get("schema", (m.raw.get("source") or {}).get("schema", "dbo"))
+    on = " AND ".join(f"a.{quote_ident(child)} = p.{quote_ident(parent)}" for child, parent in join["match"].items())
+    return f" LEFT JOIN {quote_ident(schema)}.{quote_ident(join['table'])} AS p ON {on}"
+
+
+def _from_sql(m : TableMapping) -> str:
+    return f"{_source_table_sql(m)} AS a{_join_sql(m)}"
+
+
+def _select_column(name : str , joined : bool) -> str:
+    """One column of the SELECT. With a join every child column is qualified (both tables have an ID)."""
+    if name.partition(".")[1] and name.partition(".")[0].isidentifier():
+        return f"{quote_ident(name)} AS [{name}]"
+    return f"a.{quote_ident(name)}" if joined else quote_ident(name)
+
+
 def derived_columns(m : TableMapping) -> list[str]:
     return [c.params["name"] for c in m.columns if c.rule == "derived"]
 
@@ -80,9 +114,10 @@ def build_select_sql(m : TableMapping , where : str | None = None , ordered : bo
     they are added to every batch in Polars (see add_is_icd).
     where   - optional SQL condition using ? placeholders (the batch windows)
     ordered - ORDER BY the natural key, so every run reads the rows in the same order"""
-    columns = [quote_ident(c) for c in collect_source_columns(m)]
+    joined = bool((m.raw.get("source") or {}).get("join"))
+    columns = [_select_column(c, joined) for c in collect_source_columns(m)]
     cols_sql = ", ".join(columns) if columns else "*"
-    sql = f"SELECT {cols_sql} FROM {_source_table_sql(m)} AS a"
+    sql = f"SELECT {cols_sql} FROM {_from_sql(m)}"
 
     if where:
         sql += f" WHERE {where}"
@@ -90,19 +125,24 @@ def build_select_sql(m : TableMapping , where : str | None = None , ordered : bo
     if ordered:
         key = (m.raw.get("source") or {}).get("natural_key")
         if isinstance(key, list) and key:
-            sql += " ORDER BY " + ", ".join(quote_ident(c) for c in key)
+            sql += " ORDER BY " + ", ".join(_select_column(c, joined).split(" AS ")[0] for c in key)
 
     return sql
 
 
 def extract_batches(conn , m : TableMapping , where : str | None = None , params : Sequence = () ,
                     batch_size : int = 50_000 , icd_lookback_seconds : int | None = None ,
-                    prod_icd_cycles : pl.DataFrame | None = None) -> Iterator[pl.DataFrame]:
+                    prod_icd_cycles : pl.DataFrame | None = None ,
+                    down : DownAggregate | None = None) -> Iterator[pl.DataFrame]:
     """Read rows in chunks. A table with the derived column is_icd needs prod_icd_cycles (the candidate cycles):
-    is_icd is computed here in the DataFrame by add_is_icd."""
+    is_icd is computed here in the DataFrame by add_is_icd. A table with the down columns needs `down` (the sums of
+    the down rows of the window): they are added to every chunk, and the keys with no production row follow as a last chunk."""
     in_frame = prod_icd_cycles is not None
+    derived = derived_columns(m)
     if not in_frame and "is_icd" in derived_columns(m):
         raise ValueError(f"Table '{m.name}': the derived rule 'is_icd' needs prod_icd_cycles.")
+    if down is None and any(c in derived for c in DOWN_COLUMNS):
+        raise ValueError(f"Table '{m.name}': the down columns need the down rows of the window (down_aggregate).")
     sql = build_select_sql(m, where=where)
     cursor = conn.cursor()
     try:
@@ -137,13 +177,24 @@ def extract_batches(conn , m : TableMapping , where : str | None = None , params
 
             if in_frame:
                 df = add_is_icd(df, prod_icd_cycles, icd_lookback_seconds or 0)
+            if down is not None:
+                df = down.apply(df)
+            if "cn" in derived:
+                df = add_cn(df)
             yield df
+
+        if down is not None:                         # down rows whose key has no production row
+            extra = down.leftover(collect_source_columns(m))
+            if extra.height:
+                if "cn" in derived:
+                    extra = add_cn(extra)
+                yield extra
     finally:
         cursor.close()
 
 
 def count_source_rows(conn , m : TableMapping , where : str | None = None , params : Sequence = ()) -> int:
-    sql = f"SELECT COUNT(*) FROM {_source_table_sql(m)}"
+    sql = f"SELECT COUNT(*) FROM {_from_sql(m)}"
     if where:
         sql += f" WHERE {where}"
 
@@ -182,7 +233,7 @@ def generate_windows(start : datetime | None , end : datetime | None , days : in
 
 def source_time_range(conn , m : TableMapping , column : str) -> tuple[datetime | None, datetime | None]:
     """Smallest and largest value of the window column in the source (None, None for an empty table)."""
-    sql = f"SELECT MIN({quote_ident(column)}), MAX({quote_ident(column)}) FROM {_source_table_sql(m)}"
+    sql = f"SELECT MIN({quote_ident(column)}), MAX({quote_ident(column)}) FROM {_from_sql(m)}"
     cursor = conn.cursor()
     try:
         cursor.execute(sql)
@@ -264,6 +315,25 @@ def add_is_icd(batch : pl.DataFrame , cycles : pl.DataFrame , lookback_seconds :
     return (batch.with_row_index("_row")
             .with_columns(pl.col("_row").is_in(flagged["_row"].implode()).cast(pl.Int64).alias("is_icd"))
             .drop("_row"))
+
+
+CN_COLUMNS = ["Prod_Qty", "CO_StdMachiningTime", "CO_StdLoadUnload", "SubOperation"]
+
+
+def add_cn(batch : pl.DataFrame) -> pl.DataFrame:
+    """Add the derived column cn (ShiftProductionDetails -> shift_production_down_details):
+        cn = Prod_Qty * (CO_StdMachiningTime + CO_StdLoadUnload) / SubOperation
+    This is the live aggregation's SUM((std_cycletime / COALESCE(sub_operation, 1)) * part_count) for one summary row,
+    where std_cycletime is the standard machining time plus the standard load/unload time (checked on the live rows of
+    2026-11-13). A NULL or 0 SubOperation counts as 1. A NULL in a quantity or a standard time gives NULL.
+    The live version leaves out parts made inside a planned downtime; this table has no count of them."""
+    missing = [c for c in CN_COLUMNS if c not in batch.columns]
+    if missing:
+        raise ValueError(f"Derived rule 'cn' needs the source column(s) {missing} in the extract.")
+    sub = pl.col("SubOperation").fill_null(1)
+    sub = pl.when(sub == 0).then(1).otherwise(sub)
+    cn = pl.col("Prod_Qty") * (pl.col("CO_StdMachiningTime") + pl.col("CO_StdLoadUnload")) / sub
+    return batch.with_columns(cn.cast(pl.Float64).alias("cn"))
 
 
 def compute_icd_lookback(conn , m : TableMapping) -> int:

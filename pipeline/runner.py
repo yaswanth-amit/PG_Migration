@@ -16,6 +16,7 @@ from pipeline import batching
 from pipeline import extract as ex
 from pipeline import load as ld
 from pipeline import maxtime as mt
+from pipeline.down_aggregate import DownAggregate
 from pipeline import tracking
 from pipeline.log_setup import get_logger, log_context, setup_logging
 from pipeline.lookups import LookupCache
@@ -477,6 +478,8 @@ def _run_window_table(m , ctx , outcome , options , src_conn , tgt_conn , tracke
             seeded = max_tracker.seed_from_target(tgt_conn, ld.target_schema_name(m), m.tgt_table)
             log.info("maxtime: %d machine(s) taken from the windows an earlier run completed", seeded)
 
+    down_cfg = m.raw.get("down_aggregate")           # sums of ShiftDownTimeDetails per production key (pipeline/down_aggregate.py)
+
     expected_total = 0
     for number, (w_start, w_end) in enumerate(windows, start=1):
         where, params = ex.window_condition(column, w_start, w_end)
@@ -501,8 +504,11 @@ def _run_window_table(m , ctx , outcome , options , src_conn , tgt_conn , tracke
                 prod_icd_cycles = None
                 if lookback is not None:
                     prod_icd_cycles = ex.extract_batch_prod_icd_cycles(src_conn, m, machines, w_start, w_end, lookback)
+                # the down columns: the down rows of this window are summed once and added to every chunk
+                down = DownAggregate.load(src_conn, down_cfg, w_start, w_end) if down_cfg else None
+                extra = {"down": down} if down is not None else {}
                 batches = ex.extract_batches(src_conn, m, where, params, batch_size=options.batch_size,
-                                             icd_lookback_seconds=lookback, prod_icd_cycles=prod_icd_cycles)
+                                             icd_lookback_seconds=lookback, prod_icd_cycles=prod_icd_cycles, **extra)
                 base_read, base_exc = outcome.rows_read, outcome.rows_excepted
                 results = _results(batches, m, ctx, counters, exception_frames, progress,
                                    on_batch=lambda: progress.table_progress(
@@ -525,8 +531,9 @@ def _run_window_table(m , ctx , outcome , options , src_conn , tgt_conn , tracke
                                                  manage_transaction=False)
 
                 progress.table_stage(m.name, "record")
-                if counters["read"] != rows_source:
-                    raise ValueError(f"window {number}: read {counters['read']} rows but the source counts {rows_source}.")
+                rows_expected = rows_source + (down.extra_rows if down is not None else 0)   # + keys with down rows only
+                if counters["read"] != rows_expected:
+                    raise ValueError(f"window {number}: read {counters['read']} rows but the source counts {rows_expected}.")
                 _check_nothing_vanished(m, counters["read"], summary.rows_loaded,
                                         summary.rows_with_exceptions, f"window {number}")
             except Exception as e:                 # noqa: BLE001 - record which window failed, then stop the table

@@ -1,5 +1,6 @@
 import pyodbc
 import psycopg
+import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -43,8 +44,45 @@ def _require(value, name : str, section : str):
     return value
 
 
+# Settings typed on the screen (ui/conn_form.py). Two ways in, both checked before connections.yaml:
+#  * use_runtime_settings(): in this process (the Streamlit page), memory only.
+#  * MIGRATION_CONNECTIONS_JSON in the environment: how the page hands them to the migration process it
+#    starts. An environment variable, not a command-line argument, so the passwords never show in a
+#    process list or a log, and are never written to disk.
+ENV_SETTINGS = "MIGRATION_CONNECTIONS_JSON"
+_RUNTIME : dict | None = None
+
+
+def use_runtime_settings(settings : dict | None) -> None:
+    """Use these settings instead of connections.yaml (None: back to the file)."""
+    global _RUNTIME
+    _RUNTIME = settings
+
+
+def runtime_settings() -> dict | None:
+    """The typed settings in force: set in this process, else handed over by the environment, else None."""
+    if _RUNTIME:
+        return _RUNTIME
+    text = os.environ.get(ENV_SETTINGS)
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except ValueError as e:
+        raise ValueError(f"{ENV_SETTINGS} is not valid JSON") from e
+    if not isinstance(parsed, dict) or not {"source", "target"} <= set(parsed):
+        raise ValueError(f"{ENV_SETTINGS} must hold 'source' and 'target' settings")
+    return parsed
+
+
 def load_settings(config_path : Path = CONFIG_PATH) -> dict:
     _load_dotenv()
+
+    typed = runtime_settings()
+    if typed:
+        return {"source": {"driver": "ODBC Driver 17 for SQL Server", "trust_server_certificate": "yes", "user": None,
+                           "password": None, **typed["source"]},
+                "target": {"port": 5432, "user": None, "password": None, **typed["target"]}}
 
     if not config_path.exists():
         raise FileNotFoundError(f"Configuration file not found: {config_path}")

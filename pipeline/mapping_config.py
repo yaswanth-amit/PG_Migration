@@ -23,12 +23,13 @@ RULES: dict[str, set[str]] = {
     "omit": set(),
     "set_null": set(),
     "derived": {"name"},            # computed from several columns, described under derived_rules in the YAML
+    "shift_time": {"part", "date", "shift"},   # the source value, or the shift's start / end on that date (from shift_details)
 }
 
 # Rules that read a source column, so 'src' must be given.
 RULES_NEEDING_SRC = {
     "copy", "cast", "bool", "bool_from_text", "trim", "map",
-    "max", "first_non_null", "coalesce", "exists_in",
+    "max", "first_non_null", "coalesce", "exists_in", "shift_time",
 }
 
 

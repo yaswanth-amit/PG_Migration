@@ -44,6 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--tables", default="all", help="'all' or a comma-separated list of table names")
     plan.add_argument("--migrated", default="", help="tables already migrated earlier (comma-separated)")
 
+    sub.add_parser("check-masters", help="list the master ids the aggregate tables use that the masters lack "
+                                         "(read-only; writes reports/missing_masters.csv)")
+
     run = sub.add_parser("run", help="migrate the selected tables")
     run.add_argument("--tables", default="all", help="'all' or a comma-separated list of table names")
     run.add_argument("--mode", choices=("rehearsal", "real"), default="rehearsal",
@@ -161,6 +164,33 @@ def cmd_run(ms : MappingSet , args : argparse.Namespace) -> int:
     return EXIT_OK if result.status != "failed" else EXIT_FAILED
 
 
+def cmd_check_masters() -> int:
+    """Read-only: compare the ids of the aggregate source tables with the source master tables."""
+    from pipeline.connections import source_connection
+    from pipeline import master_check
+    with source_connection() as conn:
+        findings = master_check.check_masters(conn, progress=print)
+    path = master_check.write_report(findings)
+    summary = master_check.summarize(findings)
+    print()
+    if not summary:
+        print("No master id is missing.")
+    else:
+        print(f"{'check':16s} {'missing ids':>12s} {'rows affected':>14s}")
+        for check, ids, rows in summary:
+            print(f"{check:16s} {ids:12d} {rows:14d}")
+        for check, _, _ in summary:
+            top = [f for f in findings if f.check == check and f.kind == "missing"][:5]
+            listed = "; ".join(f"{f.value or '(blank)'} ({f.source_table}: {f.rows} rows)" for f in top)
+            print()
+            print(f"{check}: {listed}")
+    empty = sum(f.rows for f in findings if f.kind == "empty")
+    print()
+    print(f"rows with no id at all (NULL, not a missing master): {empty}")
+    print(f"full list: {path}")
+    return EXIT_OK
+
+
 def print_summary(result) -> None:
     """Counts and names only; never row values."""
     print(f"\nrun {result.run_id}  mode={result.mode}  status={result.status}")
@@ -179,6 +209,8 @@ def main(argv : list[str] | None = None) -> int:
 
     if args.command == "list":
         return cmd_list(ms)
+    if args.command == "check-masters":
+        return cmd_check_masters()
     if args.command == "plan":
         migrated = {n.strip() for n in args.migrated.split(",") if n.strip()}
         return cmd_plan(ms, parse_tables(args.tables), migrated)

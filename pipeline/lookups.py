@@ -44,7 +44,7 @@ class LookupCache:
         schema_name = (m.raw.get("target") or {}).get("schema", "public")
         target_cols = read_target_schema(self.pg_conn, schema_name, m.tgt_table)
 
-        wanted = [*use.keys, use.ret]
+        wanted = list(dict.fromkeys([*use.keys, use.ret]))     # a lookup may return its own key (down_id -> down_id): one column
         dtypes = {c: polars_dtype(target_cols[c].pg_type) for c in wanted}
 
         query = sql.SQL("SELECT {cols} FROM {tbl}").format(

@@ -174,12 +174,19 @@ def mark_running_as_stopped() -> str | None:
 # ----------------------------------------------------------------------------- connection info (no secrets)
 
 def connection_info() -> dict:
-    """Host and database names only, read straight from connections.yaml. Passwords are never loaded."""
-    path = BASE_DIR / "config" / "connections.yaml"
-    try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except OSError:
-        return {}
+    """Host and database names only: from the settings typed on the screen when there are any, else straight
+    from connections.yaml. Passwords are never read here."""
+    from pipeline import connections
+    typed = connections._RUNTIME
+    if typed:
+        raw = {"source": {k: typed["source"].get(k) for k in ("server", "database")},
+               "target": {k: typed["target"].get(k) for k in ("host", "port", "database")}}
+    else:
+        path = BASE_DIR / "config" / "connections.yaml"
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except OSError:
+            return {}
     src, tgt = raw.get("source") or {}, raw.get("target") or {}
     return {"source": f"{src.get('server', '?')} / {src.get('database', '?')}",
             "target": f"{tgt.get('host', '?')}:{tgt.get('port', 5432)} / {tgt.get('database', '?')}",
@@ -212,14 +219,26 @@ def build_run_command(tables : list[str] | None , mode : str , confirm_target : 
     return command
 
 
-def launch_run(command : list[str]) -> tuple[subprocess.Popen, Path]:
+def run_environment(settings : dict | None) -> dict[str, str]:
+    """The environment of the migration process. Connection settings typed on the screen (passwords included)
+    travel here, in memory, and not in the command line, so they show in no process list, log or file."""
+    from pipeline.connections import ENV_SETTINGS
+    env = dict(os.environ)
+    env.pop(ENV_SETTINGS, None)
+    if settings:
+        env[ENV_SETTINGS] = json.dumps(settings)
+    return env
+
+
+def launch_run(command : list[str], settings : dict | None = None) -> tuple[subprocess.Popen, Path]:
     """Start the migration as its own process, so a browser refresh or a closed tab never interrupts it.
     Its console output goes to a file, which the Monitor tab shows (this is where an early error appears)."""
     log_setup.LOG_DIR.mkdir(parents=True, exist_ok=True)
     out_path = log_setup.LOG_DIR / f"launch_{datetime.now():%Y%m%d_%H%M%S}.txt"
     handle = open(out_path, "w", encoding="utf-8")
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    process = subprocess.Popen(command, cwd=BASE_DIR, stdout=handle, stderr=subprocess.STDOUT, creationflags=flags)
+    process = subprocess.Popen(command, cwd=BASE_DIR, stdout=handle, stderr=subprocess.STDOUT, creationflags=flags,
+                               env=run_environment(settings))
     return process, out_path
 
 
